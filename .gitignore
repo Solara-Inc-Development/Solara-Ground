@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+Thumbs.db
+
+# Runtime client files
+/logs
+/screenshots
+/resourcepacks
+/options.toml

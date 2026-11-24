@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ground-protocol",
+    "crates/ground-world",
+    "crates/ground-render",
+    "crates/ground-client",
+    "tools/mc-codegen",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/Solara-Inc-Development/Solara-Ground"
+rust-version = "1.85"
+
+[workspace.dependencies]
+aes = "0.8"
+anyhow = "1"
+bytes = "1"
+bytemuck = { version = "1", features = ["derive"] }
+cfb8 = "0.8"
+cipher = "0.4"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+glam = "0.29"
+num-bigint = "0.4"
+pollster = "0.4"
+rand = "0.8"
+rayon = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rsa = { version = "0.9", features = ["sha1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+wgpu = "24"
+winit = "0.30"
+
+ground-protocol = { path = "crates/ground-protocol" }
+ground-world = { path = "crates/ground-world" }
+ground-render = { path = "crates/ground-render" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
