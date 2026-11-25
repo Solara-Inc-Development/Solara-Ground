@@ -11,11 +11,20 @@ use ground_protocol::config_play::{
     encode_start_destroy_block, encode_use_item_on, read_next_play_event,
 };
 use ground_protocol::generated_packets;
-use ground_render::{Frustum, RemotePlayerVisual, VoxelCamera, WorldSectionMesh, run_voxel_window};
+use ground_render::{
+    ClientWindowAction, Frustum, LiveRenderBridge, RemotePlayerVisual, RenderSceneUpdate,
+    VoxelCamera, WorldSectionMesh, build_frustum_culled_indirect_cmds, pack_mega_mesh_batch,
+    run_voxel_window,
+};
 use ground_world::assets::LocalMojangAssets;
+use ground_world::mesh::mesh_chunk_column;
 use ground_world::physics::{ClientWorldMap, PlayerBody, raycast_blocks};
-use ground_world::{OVERWORLD_MIN_Y, OVERWORLD_SECTIONS, decode_and_mesh_chunks_parallel};
+use ground_world::{
+    ChunkPos, OVERWORLD_MIN_Y, OVERWORLD_SECTIONS, decode_and_mesh_chunks_parallel,
+};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use tracing::info;
 use uuid::Uuid;
 
@@ -33,15 +42,15 @@ struct Cli {
     #[arg(long)]
     connect: Option<String>,
 
-    /// Run protocol + chunk decoding + greedy meshing + frustum culling without opening an OS window
+    /// Run protocol + chunk decoding + greedy meshing + Mega-Buffer indirect culling without a window
     #[arg(long)]
     headless_smoke: bool,
 
-    /// Run Phase 3 gameplay smoke (AABB physics, DDA raycast, block break/place, /save Anvil command)
+    /// Run gameplay smoke (AABB physics, DDA raycast, block break/place, /save Anvil command)
     #[arg(long)]
     gameplay_smoke: bool,
 
-    /// Run Phase 4 multiplayer + dynamic procedural chunk streaming + entity sync E2E test
+    /// Run Phase 4+5 multiplayer, dynamic chunk streaming, Folia /tps & /plugins, and Mega-Buffer E2E test
     #[cfg(feature = "dev-offline")]
     #[arg(long)]
     multiplayer_smoke: bool,
@@ -74,6 +83,199 @@ fn parse_host_port(addr: &str) -> Result<(&str, u16)> {
     }
 }
 
+fn flatten_chunk_meshes(
+    chunk_meshes: &HashMap<ChunkPos, Vec<WorldSectionMesh>>,
+) -> Vec<WorldSectionMesh> {
+    let mut flat = Vec::new();
+    for list in chunk_meshes.values() {
+        flat.extend(list.iter().cloned());
+    }
+    flat
+}
+
+fn spawn_live_network_bridge(
+    mut conn: ClientConnection,
+    mut world_map: ClientWorldMap,
+    mut chunk_meshes: HashMap<ChunkPos, Vec<WorldSectionMesh>>,
+    initial_players: Vec<RemotePlayerVisual>,
+) -> LiveRenderBridge {
+    use generated_packets::play::serverbound as c2s;
+
+    let (scene_tx, scene_rx) = mpsc::channel::<RenderSceneUpdate>();
+    let (action_tx, action_rx) = mpsc::channel::<ClientWindowAction>();
+
+    let mut remote_players: HashMap<i32, RemotePlayerVisual> = initial_players
+        .into_iter()
+        .map(|p| (p.entity_id, p))
+        .collect();
+
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+
+        rt.block_on(async move {
+            let mut next_seq = 1i32;
+            let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(16));
+            drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = drain_tick.tick() => {
+                        let mut disconnected = false;
+                        loop {
+                            match action_rx.try_recv() {
+                                Ok(ClientWindowAction::Move { feet_pos, yaw_deg, pitch_deg, on_ground }) => {
+                                    let _ = conn.send_packet(
+                                        c2s::MOVE_PLAYER_POS_ROT,
+                                        &encode_move_player_pos_rot(feet_pos, yaw_deg, pitch_deg, on_ground),
+                                    ).await;
+                                }
+                                Ok(ClientWindowAction::SelectHotbarSlot(slot)) => {
+                                    let _ = conn.send_packet(
+                                        c2s::SET_CARRIED_ITEM,
+                                        &encode_set_carried_item(slot),
+                                    ).await;
+                                }
+                                Ok(ClientWindowAction::BreakLook { eye_pos, look_dir }) => {
+                                    if let Some(hit) = raycast_blocks(&world_map, eye_pos, look_dir, 6.0) {
+                                        let seq = next_seq;
+                                        next_seq += 1;
+                                        let _ = conn.send_packet(
+                                            c2s::PLAYER_ACTION,
+                                            &encode_start_destroy_block(hit.block_pos, hit.face_direction as u8, seq),
+                                        ).await;
+                                    }
+                                }
+                                Ok(ClientWindowAction::PlaceLook { eye_pos, look_dir }) => {
+                                    if let Some(hit) = raycast_blocks(&world_map, eye_pos, look_dir, 6.0) {
+                                        let seq = next_seq;
+                                        next_seq += 1;
+                                        let _ = conn.send_packet(
+                                            c2s::USE_ITEM_ON,
+                                            &encode_use_item_on(hit.block_pos, hit.face_direction, seq),
+                                        ).await;
+                                    }
+                                }
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if disconnected {
+                            break;
+                        }
+                    }
+                    ev_res = read_next_play_event(&mut conn) => {
+                        let Ok(ev) = ev_res else {
+                            break;
+                        };
+                        match ev {
+                            PlayServerEvent::LevelChunkWithLight(raw) => {
+                                let batch = vec![raw];
+                                if let Ok(Ok(cols)) = tokio::task::spawn_blocking(move || {
+                                    decode_and_mesh_chunks_parallel(&batch, OVERWORLD_SECTIONS)
+                                }).await {
+                                    for col in cols {
+                                        let mut ws = Vec::new();
+                                        for (sec_idx, mesh) in col.meshes.into_iter().enumerate() {
+                                            if !mesh.is_empty() {
+                                                let world_y = OVERWORLD_MIN_Y + (sec_idx as i32) * 16;
+                                                ws.push(WorldSectionMesh {
+                                                    origin: Vec3::new(
+                                                        (col.pos.x * 16) as f32,
+                                                        world_y as f32,
+                                                        (col.pos.z * 16) as f32,
+                                                    ),
+                                                    mesh,
+                                                });
+                                            }
+                                        }
+                                        chunk_meshes.insert(col.pos, ws);
+                                        world_map.insert_chunk(col.pos, col.sections);
+                                    }
+                                    if scene_tx.send(RenderSceneUpdate::ReplaceSections(flatten_chunk_meshes(&chunk_meshes))).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            PlayServerEvent::BlockUpdate { pos, state_id } => {
+                                if let Some((cpos, _)) = world_map.set_block(pos.0, pos.1, pos.2, state_id)
+                                    && let Some((_, sections)) = world_map.chunks_iter().find(|&(p, _)| *p == cpos)
+                                {
+                                    let meshes = mesh_chunk_column(sections);
+                                    let mut ws = Vec::new();
+                                    for (sec_idx, mesh) in meshes.into_iter().enumerate() {
+                                        if !mesh.is_empty() {
+                                            let world_y = OVERWORLD_MIN_Y + (sec_idx as i32) * 16;
+                                            ws.push(WorldSectionMesh {
+                                                origin: Vec3::new(
+                                                    (cpos.x * 16) as f32,
+                                                    world_y as f32,
+                                                    (cpos.z * 16) as f32,
+                                                ),
+                                                mesh,
+                                            });
+                                        }
+                                    }
+                                    chunk_meshes.insert(cpos, ws);
+                                    let _ = scene_tx.send(RenderSceneUpdate::ReplaceSections(flatten_chunk_meshes(&chunk_meshes)));
+                                }
+                            }
+                            PlayServerEvent::AddEntity(ent) if ent.entity_type == ENTITY_TYPE_PLAYER => {
+                                remote_players.insert(
+                                    ent.entity_id,
+                                    RemotePlayerVisual {
+                                        entity_id: ent.entity_id,
+                                        feet_pos: Vec3::new(ent.position[0] as f32, ent.position[1] as f32, ent.position[2] as f32),
+                                        yaw_deg: ent.yaw_deg,
+                                    },
+                                );
+                                let _ = scene_tx.send(RenderSceneUpdate::RemotePlayers(remote_players.values().copied().collect()));
+                            }
+                            PlayServerEvent::TeleportEntity(tp) => {
+                                if let Some(p) = remote_players.get_mut(&tp.entity_id) {
+                                    p.feet_pos = Vec3::new(tp.position[0] as f32, tp.position[1] as f32, tp.position[2] as f32);
+                                    p.yaw_deg = tp.yaw_deg;
+                                    let _ = scene_tx.send(RenderSceneUpdate::RemotePlayers(remote_players.values().copied().collect()));
+                                }
+                            }
+                            PlayServerEvent::RemoveEntities(ids) => {
+                                let mut changed = false;
+                                for id in ids {
+                                    changed |= remote_players.remove(&id).is_some();
+                                }
+                                if changed {
+                                    let _ = scene_tx.send(RenderSceneUpdate::RemotePlayers(remote_players.values().copied().collect()));
+                                }
+                            }
+                            PlayServerEvent::Teleport(tp) => {
+                                let _ = scene_tx.send(RenderSceneUpdate::TeleportCamera {
+                                    position: Vec3::new(tp.position[0] as f32, tp.position[1] as f32 + 1.62, tp.position[2] as f32),
+                                    yaw_rad: tp.yaw_deg.to_radians(),
+                                    pitch_rad: tp.pitch_deg.to_radians(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    LiveRenderBridge {
+        scene_rx,
+        action_tx,
+    }
+}
+
 async fn run_gameplay_smoke_session(
     conn: &mut ClientConnection,
     world: &mut ClientWorldMap,
@@ -81,7 +283,6 @@ async fn run_gameplay_smoke_session(
 ) -> Result<()> {
     use generated_packets::play::serverbound as c2s;
 
-    // 1. Run player gravity + AABB collision until landing on the spawn plaza
     let mut body = PlayerBody::new(spawn_pos);
     for _ in 0..30 {
         body.step(world, [0.0, 0.0], false, 0.05);
@@ -98,11 +299,9 @@ async fn run_gameplay_smoke_session(
     )
     .await?;
 
-    // 2. Raycast straight down from eye position to hit the plaza block beneath feet
     let hit = raycast_blocks(world, body.eye_pos(), [0.0, -1.0, 0.0], 5.0)
         .context("DDA raycast downward missed floor")?;
 
-    // Break a nearby block at (6, -59, 6) and wait for live BLOCK_UPDATE -> AIR
     let target_break = (6, -59, 6);
     conn.send_packet(
         c2s::PLAYER_ACTION,
@@ -125,15 +324,11 @@ async fn run_gameplay_smoke_session(
         bail!("did not receive live BLOCK_UPDATE for broken block");
     }
 
-    // 3. Select hotbar slot 7 (GLASS) and place it on top of hit.block_pos -> adjacent_pos
     conn.send_packet(c2s::SET_CARRIED_ITEM, &encode_set_carried_item(7))
         .await?;
     let place_base = (7, -59, 7);
-    conn.send_packet(
-        c2s::USE_ITEM_ON,
-        &encode_use_item_on(place_base, 1, 2), // Direction::Up (1) -> places at (7, -58, 7)
-    )
-    .await?;
+    conn.send_packet(c2s::USE_ITEM_ON, &encode_use_item_on(place_base, 1, 2))
+        .await?;
 
     let mut placed_state = None;
     for _ in 0..24 {
@@ -149,7 +344,6 @@ async fn run_gameplay_smoke_session(
         bail!("expected placed GLASS state, got {placed_state:?}");
     }
 
-    // 4. Trigger `/save` command to persist modified chunks to Anvil .mca region files!
     conn.send_packet(c2s::CHAT_COMMAND, &encode_chat_command("save"))
         .await?;
     let mut save_msg = String::new();
@@ -177,32 +371,42 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
     use generated_packets::play::serverbound as c2s;
     use ground_render::{build_hud_vertices, build_remote_players_mesh};
 
-    // 1. Connect Client A ("SolaraAlpha")
     let (mut conn_a, fin_a) =
         ground_protocol::client::login_dev_offline(host, port, "SolaraAlpha").await?;
     complete_configuration(&mut conn_a, 4).await?;
     let boot_a = bootstrap_play_session(&mut conn_a).await?;
 
-    // Multi-core decode + 2D greedy-mesh Client A's initial procedural terrain chunks across all CPU cores!
     let initial_raw = boot_a.raw_chunk_packets.clone();
     let decoded_initial = tokio::task::spawn_blocking(move || {
         decode_and_mesh_chunks_parallel(&initial_raw, OVERWORLD_SECTIONS)
     })
     .await
     .context("join multi-core initial chunk decode/mesh")??;
-    let initial_quads: usize = decoded_initial
-        .iter()
-        .flat_map(|col| &col.meshes)
-        .map(|m| m.quad_count())
-        .sum();
 
-    // 2. Connect Client B ("SolaraBravo") while Client A is online!
+    let mut initial_sections = Vec::new();
+    let mut initial_quads = 0usize;
+    for col in &decoded_initial {
+        for (sec_idx, m) in col.meshes.iter().enumerate() {
+            if !m.is_empty() {
+                initial_quads += m.quad_count();
+                initial_sections.push(WorldSectionMesh {
+                    origin: Vec3::new(
+                        (col.pos.x * 16) as f32,
+                        (OVERWORLD_MIN_Y + (sec_idx as i32) * 16) as f32,
+                        (col.pos.z * 16) as f32,
+                    ),
+                    mesh: m.clone(),
+                });
+            }
+        }
+    }
+    let mega = pack_mega_mesh_batch(&initial_sections);
+
     let (mut conn_b, _fin_b) =
         ground_protocol::client::login_dev_offline(host, port, "SolaraBravo").await?;
     complete_configuration(&mut conn_b, 4).await?;
     let boot_b = bootstrap_play_session(&mut conn_b).await?;
 
-    // Verify Client B saw Client A in its initial tab-list & visible 3D player entities
     let b_saw_a_tab = boot_b
         .initial_players
         .iter()
@@ -217,7 +421,6 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         );
     }
 
-    // Verify Client A receives live PlayerInfoUpdate + AddEntity for Client B
     let mut a_saw_b_tab = false;
     let mut a_saw_b_entity = None;
     for _ in 0..24 {
@@ -248,7 +451,6 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         );
     }
 
-    // 3. Client B walks East across chunk boundaries (x = 8 -> 42, chunk 0 -> chunk 2)
     conn_b
         .send_packet(
             c2s::MOVE_PLAYER_POS_ROT,
@@ -256,8 +458,6 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         )
         .await?;
 
-    // Verify Client B dynamically receives newly streamed procedural chunks from Solara-Sky
-    // and processes them in a multi-core rayon batch off the async network thread!
     let mut streamed_raw_packets = Vec::new();
     for _ in 0..32 {
         let ev = tokio::time::timeout(
@@ -291,7 +491,6 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         .map(|m| m.quad_count())
         .sum();
 
-    // Verify Client A receives live TeleportEntity tracking Client B's movement to x = 42.5!
     let mut tracked_x = 0.0f64;
     for _ in 0..24 {
         if let PlayServerEvent::TeleportEntity(tp) = read_next_play_event(&mut conn_a).await?
@@ -307,8 +506,41 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         bail!("Client A did not receive TeleportEntity movement for Client B (got x={tracked_x})");
     }
 
-    // Exercise 3D remote player mesh & 2D HUD builder
-    let (p_verts, p_idx) = build_remote_players_mesh(&[RemotePlayerVisual {
+    // Verify Phase 5 Folia region TPS profiler (/tps) & SkyPlugin command (/plugins & /solara)
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("tps"))
+        .await?;
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("plugins"))
+        .await?;
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("solara"))
+        .await?;
+
+    let mut tps_line = String::new();
+    let mut plugins_line = String::new();
+    let mut custom_plugin_line = String::new();
+    for _ in 0..32 {
+        if let PlayServerEvent::SystemChat { text, .. } = read_next_play_event(&mut conn_a).await? {
+            if text.contains("Solara-Sky TPS") {
+                tps_line = text;
+            } else if text.contains("SolaraCore") {
+                plugins_line = text;
+            } else if text.contains("Folia-style") {
+                custom_plugin_line = text;
+            }
+        }
+        if !tps_line.is_empty() && !plugins_line.is_empty() && !custom_plugin_line.is_empty() {
+            break;
+        }
+    }
+    if tps_line.is_empty() || plugins_line.is_empty() || custom_plugin_line.is_empty() {
+        bail!(
+            "missing Phase 5 command output (tps={tps_line:?}, plugins={plugins_line:?}, solara={custom_plugin_line:?})"
+        );
+    }
+
+    let (_p_verts, p_idx) = build_remote_players_mesh(&[RemotePlayerVisual {
         entity_id: boot_b.join_info.entity_id,
         feet_pos: Vec3::new(tracked_x as f32, -48.0, 8.5),
         yaw_deg: 90.0,
@@ -316,15 +548,18 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
     let hud_verts = build_hud_vertices(1280, 720, 0);
 
     println!(
-        "Multiplayer Smoke OK | InitialChunks: {} (GreedyQuads: {}) | DynamicStreamedChunks: {} (Quads: {}) | RemoteTrackedX: {:.1} | PlayerMeshVerts: {} (Tris: {}) | HudVerts: {}",
+        "Multiplayer+Phase5 Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | DynamicChunks: {} (Quads: {}) | RemoteX: {:.1} | PlayerTris: {} | HudVerts: {}\n  -> {}\n  -> {}\n  -> {}",
         boot_a.raw_chunk_packets.len(),
         initial_quads,
+        (mega.vertices.len() * 8) / 1024,
         streamed_new_chunks,
         streamed_quads,
         tracked_x,
-        p_verts.len(),
         p_idx.len() / 3,
-        hud_verts.len()
+        hud_verts.len(),
+        tps_line,
+        plugins_line,
+        custom_plugin_line
     );
     Ok(())
 }
@@ -433,23 +668,28 @@ async fn main() -> Result<()> {
         .context("join multi-core chunk decode & greedy mesh")??;
 
         let mut world_map = ClientWorldMap::new();
+        let mut chunk_meshes: HashMap<ChunkPos, Vec<WorldSectionMesh>> = HashMap::new();
         let mut world_sections = Vec::new();
         let mut total_quads = 0usize;
         for col in decoded_columns {
+            let mut col_ws = Vec::new();
             for (sec_idx, mesh) in col.meshes.into_iter().enumerate() {
                 if !mesh.is_empty() {
                     total_quads += mesh.quad_count();
                     let world_y = OVERWORLD_MIN_Y + (sec_idx as i32) * 16;
-                    world_sections.push(WorldSectionMesh {
+                    let wsm = WorldSectionMesh {
                         origin: Vec3::new(
                             (col.pos.x * 16) as f32,
                             world_y as f32,
                             (col.pos.z * 16) as f32,
                         ),
                         mesh,
-                    });
+                    };
+                    col_ws.push(wsm.clone());
+                    world_sections.push(wsm);
                 }
             }
+            chunk_meshes.insert(col.pos, col_ws);
             world_map.insert_chunk(col.pos, col.sections);
         }
 
@@ -486,23 +726,23 @@ async fn main() -> Result<()> {
 
         if cli.headless_smoke {
             let frustum = Frustum::from_view_proj(cam.view_proj_matrix());
-            let visible = world_sections
-                .iter()
-                .filter(|s| frustum.intersects_aabb(s.origin, s.origin + Vec3::splat(16.0)))
-                .count();
+            let mega = pack_mega_mesh_batch(&world_sections);
+            let mut indirect_cmds = Vec::new();
+            build_frustum_culled_indirect_cmds(&mega.slots, &frustum, &mut indirect_cmds);
             println!(
-                "Play Smoke OK | Player: {} | Chunks: {} | MeshedSections: {} | VisibleInFrustum: {} | GreedyQuads: {} | RemotePlayers: {}",
+                "Play Smoke OK | Player: {} | Chunks: {} | MegaSlots: {} | IndirectDraws: {} | GreedyQuads: {} | MegaVboKB: {}",
                 finished.username,
                 world_map.chunk_count(),
-                world_sections.len(),
-                visible,
+                mega.slots.len(),
+                indirect_cmds.len(),
                 total_quads,
-                remote_players.len()
+                (mega.vertices.len() * 8) / 1024
             );
             return Ok(());
         }
 
-        drop(conn);
+        let bridge =
+            spawn_live_network_bridge(conn, world_map, chunk_meshes, remote_players.clone());
         return run_voxel_window(
             format!(
                 "Solara-Ground {} — {}",
@@ -513,6 +753,7 @@ async fn main() -> Result<()> {
             cam,
             world_sections,
             remote_players,
+            Some(bridge),
         );
     }
 

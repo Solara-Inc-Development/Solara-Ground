@@ -1,5 +1,5 @@
-//! Native `wgpu` + `winit` 3D voxel, multiplayer player entity, and 2D HUD renderer
-//! for Solara-Ground (Windows & Linux).
+//! Native `wgpu` + `winit` 3D voxel, GPU mega-buffer + `multi_draw_indexed_indirect`,
+//! multiplayer player entity, and 2D HUD renderer for Solara-Ground (Windows & Linux).
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -11,11 +11,12 @@ use ground_world::generated_blocks;
 use ground_world::mesh::{PackedVoxelVertex, SectionMesh};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -33,6 +34,44 @@ pub const HUD_HOTBAR_BLOCKS: [u32; 9] = [
     generated_blocks::default_state::GLOWSTONE,
 ];
 
+/// Non-blocking updates pushed from the background network & `rayon` worker to the render thread.
+#[derive(Debug)]
+pub enum RenderSceneUpdate {
+    ReplaceSections(Vec<WorldSectionMesh>),
+    RemotePlayers(Vec<RemotePlayerVisual>),
+    TeleportCamera {
+        position: Vec3,
+        yaw_rad: f32,
+        pitch_rad: f32,
+    },
+}
+
+/// Non-blocking gameplay actions pushed from the `winit` window thread to the network worker.
+#[derive(Debug, Clone, Copy)]
+pub enum ClientWindowAction {
+    Move {
+        feet_pos: [f64; 3],
+        yaw_deg: f32,
+        pitch_deg: f32,
+        on_ground: bool,
+    },
+    SelectHotbarSlot(u16),
+    BreakLook {
+        eye_pos: [f64; 3],
+        look_dir: [f64; 3],
+    },
+    PlaceLook {
+        eye_pos: [f64; 3],
+        look_dir: [f64; 3],
+    },
+}
+
+/// Optional live multiplayer channels wired into `run_voxel_window`.
+pub struct LiveRenderBridge {
+    pub scene_rx: Receiver<RenderSceneUpdate>,
+    pub action_tx: Sender<ClientWindowAction>,
+}
+
 /// Returns the `wgpu` vertex buffer layout matching `PackedVoxelVertex` (8 bytes/vertex).
 pub const fn packed_voxel_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Uint32x2];
@@ -40,6 +79,96 @@ pub const fn packed_voxel_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
         array_stride: std::mem::size_of::<PackedVoxelVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &ATTRS,
+    }
+}
+
+/// Exact 20-byte GPU `VkDrawIndexedIndirectCommand` / WebGPU `DrawIndexedIndirectArgs` struct.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct DrawIndexedIndirectCmd {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub first_index: u32,
+    pub base_vertex: i32,
+    pub first_instance: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DrawIndexedIndirectCmd>() == 20);
+
+/// Sub-allocated section draw metadata inside the contiguous GPU Mega-Buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct MegaSectionSlot {
+    pub origin: Vec3,
+    pub cmd: DrawIndexedIndirectCmd,
+}
+
+/// Contiguous CPU staging payload packing all world chunk sections into a single VBO, single IBO,
+/// and single section-origin storage array for zero-bind-switch / `multi_draw_indexed_indirect` rendering.
+#[derive(Debug, Default)]
+pub struct PackedMegaMesh {
+    pub vertices: Vec<PackedVoxelVertex>,
+    pub indices: Vec<u32>,
+    pub origins: Vec<[f32; 4]>,
+    pub slots: Vec<MegaSectionSlot>,
+}
+
+pub fn pack_mega_mesh_batch(world_sections: &[WorldSectionMesh]) -> PackedMegaMesh {
+    let total_verts: usize = world_sections.iter().map(|s| s.mesh.vertices.len()).sum();
+    let total_indices: usize = world_sections.iter().map(|s| s.mesh.indices.len()).sum();
+    let non_empty = world_sections.iter().filter(|s| !s.mesh.is_empty()).count();
+
+    let mut vertices = Vec::with_capacity(total_verts);
+    let mut indices = Vec::with_capacity(total_indices);
+    let mut origins = Vec::with_capacity(non_empty.max(1));
+    let mut slots = Vec::with_capacity(non_empty);
+
+    for ws in world_sections {
+        if ws.mesh.is_empty() {
+            continue;
+        }
+        let slot_idx = origins.len() as u32;
+        let base_vertex = vertices.len() as i32;
+        let first_index = indices.len() as u32;
+        let index_count = ws.mesh.indices.len() as u32;
+
+        vertices.extend_from_slice(&ws.mesh.vertices);
+        indices.extend_from_slice(&ws.mesh.indices);
+        origins.push([ws.origin.x, ws.origin.y, ws.origin.z, 0.0]);
+        slots.push(MegaSectionSlot {
+            origin: ws.origin,
+            cmd: DrawIndexedIndirectCmd {
+                index_count,
+                instance_count: 1,
+                first_index,
+                base_vertex,
+                first_instance: slot_idx,
+            },
+        });
+    }
+
+    if origins.is_empty() {
+        origins.push([0.0, 0.0, 0.0, 0.0]);
+    }
+
+    PackedMegaMesh {
+        vertices,
+        indices,
+        origins,
+        slots,
+    }
+}
+
+/// Filters `slots` against `frustum` into `out_cmds` without allocating.
+pub fn build_frustum_culled_indirect_cmds(
+    slots: &[MegaSectionSlot],
+    frustum: &Frustum,
+    out_cmds: &mut Vec<DrawIndexedIndirectCmd>,
+) {
+    out_cmds.clear();
+    for s in slots {
+        if frustum.intersects_aabb(s.origin, s.origin + Vec3::splat(16.0)) {
+            out_cmds.push(s.cmd);
+        }
     }
 }
 
@@ -107,7 +236,6 @@ fn push_oriented_box(
     let (x1, y1, z1) = (local_max.x, local_max.y, local_max.z);
 
     let faces: [([Vec3; 4], f32); 6] = [
-        // +Y top
         (
             [
                 Vec3::new(x0, y1, z0),
@@ -117,7 +245,6 @@ fn push_oriented_box(
             ],
             1.0,
         ),
-        // -Y bottom
         (
             [
                 Vec3::new(x0, y0, z1),
@@ -127,7 +254,6 @@ fn push_oriented_box(
             ],
             0.55,
         ),
-        // +Z front
         (
             [
                 Vec3::new(x0, y0, z1),
@@ -137,7 +263,6 @@ fn push_oriented_box(
             ],
             0.86,
         ),
-        // -Z back
         (
             [
                 Vec3::new(x1, y0, z0),
@@ -147,7 +272,6 @@ fn push_oriented_box(
             ],
             0.72,
         ),
-        // +X right
         (
             [
                 Vec3::new(x1, y0, z1),
@@ -157,7 +281,6 @@ fn push_oriented_box(
             ],
             0.78,
         ),
-        // -X left
         (
             [
                 Vec3::new(x0, y0, z0),
@@ -204,7 +327,6 @@ pub fn build_remote_players_mesh(players: &[RemotePlayerVisual]) -> (Vec<EntityV
         let skin = [226, 178, 146, 255];
         let trousers = [58, 66, 128, 255];
 
-        // Legs (0.0 .. 0.75)
         push_oriented_box(
             &mut verts,
             &mut indices,
@@ -223,7 +345,6 @@ pub fn build_remote_players_mesh(players: &[RemotePlayerVisual]) -> (Vec<EntityV
             Vec3::new(0.25, 0.75, 0.125),
             trousers,
         );
-        // Torso (0.75 .. 1.50)
         push_oriented_box(
             &mut verts,
             &mut indices,
@@ -233,7 +354,6 @@ pub fn build_remote_players_mesh(players: &[RemotePlayerVisual]) -> (Vec<EntityV
             Vec3::new(0.25, 1.50, 0.125),
             tunic,
         );
-        // Arms (0.75 .. 1.50)
         push_oriented_box(
             &mut verts,
             &mut indices,
@@ -252,7 +372,6 @@ pub fn build_remote_players_mesh(players: &[RemotePlayerVisual]) -> (Vec<EntityV
             Vec3::new(0.50, 1.50, 0.125),
             tunic,
         );
-        // Head (1.50 .. 2.00 — scaled to 1.80 total height: 1.35 .. 1.85)
         push_oriented_box(
             &mut verts,
             &mut indices,
@@ -271,7 +390,7 @@ fn push_hud_rect_px(
     out: &mut Vec<HudVertex>,
     screen_w: f32,
     screen_h: f32,
-    rect_px: [f32; 4], // [x, y_from_top, w, h]
+    rect_px: [f32; 4],
     color: [u8; 4],
 ) {
     let [x, y, w, h] = rect_px;
@@ -305,7 +424,6 @@ pub fn build_hud_vertices(width: u32, height: u32, selected_slot: usize) -> Vec<
     let sh = height.max(1) as f32;
     let mut out = Vec::with_capacity(256);
 
-    // 1. Center Crosshair (+ with subtle dark contrast shadow)
     let cx = (sw * 0.5).floor();
     let cy = (sh * 0.5).floor();
     push_hud_rect_px(
@@ -337,14 +455,12 @@ pub fn build_hud_vertices(width: u32, height: u32, selected_slot: usize) -> Vec<
         [245, 248, 255, 235],
     );
 
-    // 2. Centered Bottom 9-Slot Hotbar
     let slot_px = 44.0f32;
     let gap_px = 4.0f32;
     let total_w = 9.0 * slot_px + 8.0 * gap_px + 12.0;
     let bar_x = ((sw - total_w) * 0.5).floor();
     let bar_y = (sh - slot_px - 22.0).max(8.0);
 
-    // Outer translucent slate bar backdrop
     push_hud_rect_px(
         &mut out,
         sw,
@@ -359,7 +475,6 @@ pub fn build_hud_vertices(width: u32, height: u32, selected_slot: usize) -> Vec<
         let sy = bar_y;
 
         if i == sel {
-            // Crisp white active-slot highlight border
             push_hud_rect_px(
                 &mut out,
                 sw,
@@ -369,7 +484,6 @@ pub fn build_hud_vertices(width: u32, height: u32, selected_slot: usize) -> Vec<
             );
         }
 
-        // Inner dark slot well
         push_hud_rect_px(
             &mut out,
             sw,
@@ -378,7 +492,6 @@ pub fn build_hud_vertices(width: u32, height: u32, selected_slot: usize) -> Vec<
             [36, 40, 48, 230],
         );
 
-        // Two-tone 3D block icon preview (top cap + shaded front face)
         let top_c = procedural_block_color(state_id, true);
         let side_c = procedural_block_color(state_id, false);
         let shaded_side = [
@@ -427,7 +540,7 @@ impl Default for VoxelCamera {
             fov_y_rad: 70.0_f32.to_radians(),
             aspect: 16.0 / 9.0,
             z_near: 0.05,
-            z_far: 1024.0,
+            z_far: 512.0,
         }
     }
 }
@@ -492,7 +605,7 @@ pub fn preferred_backends() -> wgpu::Backends {
     wgpu::Backends::VULKAN | wgpu::Backends::DX12
 }
 
-/// Positioned CPU chunk-section mesh ready to be uploaded to GPU buffers.
+/// Positioned CPU chunk-section mesh ready to be packed into the GPU Mega-Buffer.
 #[derive(Debug, Clone)]
 pub struct WorldSectionMesh {
     pub origin: Vec3,
@@ -503,20 +616,7 @@ pub struct WorldSectionMesh {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniformRaw {
     view_proj: [[f32; 4]; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct SectionUniformRaw {
-    origin: [f32; 4],
-}
-
-struct GpuSectionDraw {
-    origin: Vec3,
-    vertex_buf: wgpu::Buffer,
-    index_buf: wgpu::Buffer,
-    index_count: u32,
-    bind_group: wgpu::BindGroup,
+    camera_pos_fog: [f32; 4],
 }
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -539,25 +639,35 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-/// Complete `wgpu` voxel rendering pipeline with 2D block texture array, greedy-meshed section draws,
-/// 3D remote player entity rendering, and 2D Crosshair + Hotbar HUD overlay.
+/// Sodium-class single-VBO Mega-Buffer `wgpu` renderer with `multi_draw_indexed_indirect`
+/// (zero per-section buffer/bind-group switches), 3D remote players, and 2D HUD.
 pub struct VoxelRenderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
+    atlas_view: wgpu::TextureView,
+    atlas_sampler: wgpu::Sampler,
+    voxel_global_bgl: wgpu::BindGroupLayout,
     voxel_pipeline: wgpu::RenderPipeline,
     entity_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
     camera_buf: wgpu::Buffer,
     voxel_global_bg: wgpu::BindGroup,
     entity_camera_bg: wgpu::BindGroup,
-    section_bgl: wgpu::BindGroupLayout,
-    sections: Vec<GpuSectionDraw>,
+    supports_mdi: bool,
+    mega_vbo: Option<wgpu::Buffer>,
+    mega_ibo: Option<wgpu::Buffer>,
+    indirect_buf: wgpu::Buffer,
+    indirect_capacity: usize,
+    section_slots: Vec<MegaSectionSlot>,
+    visible_cmds: Vec<DrawIndexedIndirectCmd>,
+    last_visible_sections: usize,
     entity_vbo: Option<wgpu::Buffer>,
     entity_ibo: Option<wgpu::Buffer>,
     entity_index_count: u32,
+    remote_player_count: usize,
     hud_vbo: Option<wgpu::Buffer>,
     hud_vertex_count: u32,
     selected_slot: usize,
@@ -587,13 +697,26 @@ impl VoxelRenderer {
             .await
             .context("no compatible Vulkan/DX12 GPU adapter found")?;
 
-        tracing::info!(adapter = ?adapter.get_info(), "initialized Solara-Ground GPU adapter");
+        let desired_mdi =
+            wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        let supports_mdi = adapter.features().contains(desired_mdi);
+        let required_features = if supports_mdi {
+            desired_mdi
+        } else {
+            wgpu::Features::empty()
+        };
+
+        tracing::info!(
+            adapter = ?adapter.get_info(),
+            multi_draw_indirect = supports_mdi,
+            "initialized Solara-Ground GPU adapter"
+        );
 
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("solara-ground-device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
@@ -623,7 +746,6 @@ impl VoxelRenderer {
         surface.configure(&device, &config);
         let depth_view = create_depth_view(&device, config.width, config.height);
 
-        // Upload 16x16x16 RGBA8 2D texture array
         let atlas_tex = device.create_texture_with_data(
             &queue,
             &wgpu::TextureDescriptor {
@@ -688,6 +810,16 @@ impl VoxelRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -705,26 +837,19 @@ impl VoxelRenderer {
             }],
         });
 
-        let section_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("section-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera-uniform"),
             contents: bytemuck::bytes_of(&CameraUniformRaw {
                 view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                camera_pos_fog: [0.0, 0.0, 0.0, 256.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let dummy_origins_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("origins-storage-init"),
+            contents: bytemuck::cast_slice(&[[0.0f32; 4]]),
+            usage: wgpu::BufferUsages::STORAGE,
         });
 
         let voxel_global_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -743,6 +868,10 @@ impl VoxelRenderer {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&atlas_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: dummy_origins_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -753,6 +882,15 @@ impl VoxelRenderer {
                 binding: 0,
                 resource: camera_buf.as_entire_binding(),
             }],
+        });
+
+        let indirect_capacity = 4096usize;
+        let indirect_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mega-indirect-draw-buf"),
+            size: (indirect_capacity * std::mem::size_of::<DrawIndexedIndirectCmd>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let voxel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -770,7 +908,7 @@ impl VoxelRenderer {
 
         let voxel_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("voxel-pipeline-layout"),
-            bind_group_layouts: &[&voxel_global_bgl, &section_bgl],
+            bind_group_layouts: &[&voxel_global_bgl],
             push_constant_ranges: &[],
         });
         let voxel_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -893,17 +1031,27 @@ impl VoxelRenderer {
             queue,
             config,
             depth_view,
+            atlas_view,
+            atlas_sampler,
+            voxel_global_bgl,
             voxel_pipeline,
             entity_pipeline,
             hud_pipeline,
             camera_buf,
             voxel_global_bg,
             entity_camera_bg,
-            section_bgl,
-            sections: Vec::new(),
+            supports_mdi,
+            mega_vbo: None,
+            mega_ibo: None,
+            indirect_buf,
+            indirect_capacity,
+            section_slots: Vec::new(),
+            visible_cmds: Vec::with_capacity(indirect_capacity),
+            last_visible_sections: 0,
             entity_vbo: None,
             entity_ibo: None,
             entity_index_count: 0,
+            remote_player_count: 0,
             hud_vbo: None,
             hud_vertex_count: 0,
             selected_slot: 0,
@@ -912,6 +1060,19 @@ impl VoxelRenderer {
         renderer.upload_remote_players(initial_players);
         renderer.rebuild_hud();
         Ok(renderer)
+    }
+
+    pub fn selected_slot(&self) -> usize {
+        self.selected_slot
+    }
+
+    pub fn draw_stats(&self) -> (usize, usize, usize, bool) {
+        (
+            self.last_visible_sections,
+            self.section_slots.len(),
+            self.remote_player_count,
+            self.supports_mdi,
+        )
     }
 
     pub fn set_selected_slot(&mut self, slot: usize) {
@@ -940,6 +1101,7 @@ impl VoxelRenderer {
     }
 
     pub fn upload_remote_players(&mut self, players: &[RemotePlayerVisual]) {
+        self.remote_player_count = players.len();
         let (verts, indices) = build_remote_players_mesh(players);
         self.entity_index_count = indices.len() as u32;
         if indices.is_empty() {
@@ -965,51 +1127,75 @@ impl VoxelRenderer {
         );
     }
 
+    /// Packs all world sections into 1 single Mega-VBO, 1 single Mega-IBO, and 1 single
+    /// storage buffer of section origins.
     pub fn upload_sections(&mut self, world_sections: &[WorldSectionMesh]) {
-        self.sections.clear();
-        for ws in world_sections {
-            if ws.mesh.is_empty() {
-                continue;
-            }
-            let vertex_buf = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("section-vbo"),
-                    contents: bytemuck::cast_slice(&ws.mesh.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let index_buf = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("section-ibo"),
-                    contents: bytemuck::cast_slice(&ws.mesh.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-            let origin_buf = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("section-origin-ubo"),
-                    contents: bytemuck::bytes_of(&SectionUniformRaw {
-                        origin: [ws.origin.x, ws.origin.y, ws.origin.z, 0.0],
-                    }),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("section-bg"),
-                layout: &self.section_bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: origin_buf.as_entire_binding(),
-                }],
-            });
-            self.sections.push(GpuSectionDraw {
-                origin: ws.origin,
-                vertex_buf,
-                index_buf,
-                index_count: ws.mesh.indices.len() as u32,
-                bind_group,
+        let packed = pack_mega_mesh_batch(world_sections);
+        self.section_slots = packed.slots;
+
+        if packed.indices.is_empty() {
+            self.mega_vbo = None;
+            self.mega_ibo = None;
+            return;
+        }
+
+        if self.section_slots.len() > self.indirect_capacity {
+            self.indirect_capacity = self.section_slots.len().next_power_of_two();
+            self.indirect_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mega-indirect-draw-buf"),
+                size: (self.indirect_capacity * std::mem::size_of::<DrawIndexedIndirectCmd>())
+                    as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
         }
+
+        self.mega_vbo = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mega-voxel-vbo"),
+                    contents: bytemuck::cast_slice(&packed.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+        );
+        self.mega_ibo = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mega-voxel-ibo"),
+                    contents: bytemuck::cast_slice(&packed.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+        );
+        let origins_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mega-section-origins-ssbo"),
+                contents: bytemuck::cast_slice(&packed.origins),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        self.voxel_global_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel-global-bg"),
+            layout: &self.voxel_global_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: origins_buf.as_entire_binding(),
+                },
+            ],
+        });
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -1026,13 +1212,31 @@ impl VoxelRenderer {
     pub fn render(&mut self, camera: &VoxelCamera) -> std::result::Result<(), wgpu::SurfaceError> {
         let vp = camera.view_proj_matrix();
         let frustum = Frustum::from_view_proj(vp);
+
         self.queue.write_buffer(
             &self.camera_buf,
             0,
             bytemuck::bytes_of(&CameraUniformRaw {
                 view_proj: vp.to_cols_array_2d(),
+                camera_pos_fog: [
+                    camera.position.x,
+                    camera.position.y,
+                    camera.position.z,
+                    camera.z_far * 0.65,
+                ],
             }),
         );
+
+        build_frustum_culled_indirect_cmds(&self.section_slots, &frustum, &mut self.visible_cmds);
+        self.last_visible_sections = self.visible_cmds.len();
+
+        if self.supports_mdi && !self.visible_cmds.is_empty() {
+            self.queue.write_buffer(
+                &self.indirect_buf,
+                0,
+                bytemuck::cast_slice(&self.visible_cmds),
+            );
+        }
 
         let frame = self.surface.get_current_texture()?;
         let view = frame
@@ -1045,7 +1249,7 @@ impl VoxelRenderer {
                 label: Some("voxel-frame-encoder"),
             });
 
-        // Pass 1: 3D Greedy-Meshed World + 3D Remote Multiplayer Entities (with Depth Buffer)
+        // Pass 1: Single-Bind Mega-Buffer 3D World + 3D Remote Players
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("voxel-3d-pass"),
@@ -1074,19 +1278,29 @@ impl VoxelRenderer {
                 occlusion_query_set: None,
             });
 
-            rpass.set_pipeline(&self.voxel_pipeline);
-            rpass.set_bind_group(0, &self.voxel_global_bg, &[]);
+            if !self.visible_cmds.is_empty()
+                && let (Some(vbo), Some(ibo)) = (&self.mega_vbo, &self.mega_ibo)
+            {
+                rpass.set_pipeline(&self.voxel_pipeline);
+                rpass.set_bind_group(0, &self.voxel_global_bg, &[]);
+                rpass.set_vertex_buffer(0, vbo.slice(..));
+                rpass.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
 
-            for sec in &self.sections {
-                let min = sec.origin;
-                let max = sec.origin + Vec3::splat(16.0);
-                if !frustum.intersects_aabb(min, max) {
-                    continue;
+                if self.supports_mdi {
+                    rpass.multi_draw_indexed_indirect(
+                        &self.indirect_buf,
+                        0,
+                        self.visible_cmds.len() as u32,
+                    );
+                } else {
+                    for cmd in &self.visible_cmds {
+                        rpass.draw_indexed(
+                            cmd.first_index..(cmd.first_index + cmd.index_count),
+                            cmd.base_vertex,
+                            cmd.first_instance..(cmd.first_instance + 1),
+                        );
+                    }
                 }
-                rpass.set_bind_group(1, &sec.bind_group, &[]);
-                rpass.set_vertex_buffer(0, sec.vertex_buf.slice(..));
-                rpass.set_index_buffer(sec.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..sec.index_count, 0, 0..1);
             }
 
             if self.entity_index_count > 0
@@ -1100,7 +1314,7 @@ impl VoxelRenderer {
             }
         }
 
-        // Pass 2: Crisp 2D Crosshair & 9-Slot Hotbar HUD Overlay
+        // Pass 2: 2D Crosshair & 9-Slot Hotbar HUD Overlay
         if self.hud_vertex_count > 0
             && let Some(hud_vbo) = &self.hud_vbo
         {
@@ -1130,15 +1344,19 @@ impl VoxelRenderer {
 }
 
 struct VoxelApp {
-    window_title: String,
+    base_title: String,
     atlas: BlockTextureAtlas,
     initial_sections: Vec<WorldSectionMesh>,
     initial_players: Vec<RemotePlayerVisual>,
+    bridge: Option<LiveRenderBridge>,
     camera: VoxelCamera,
     window: Option<Arc<Window>>,
     renderer: Option<VoxelRenderer>,
     pressed_keys: HashSet<KeyCode>,
     last_frame: Instant,
+    net_move_accum: f32,
+    fps_timer: f32,
+    fps_frames: u32,
 }
 
 impl ApplicationHandler for VoxelApp {
@@ -1147,7 +1365,7 @@ impl ApplicationHandler for VoxelApp {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title(self.window_title.clone())
+            .with_title(self.base_title.clone())
             .with_inner_size(PhysicalSize::new(1280, 720));
         match event_loop.create_window(attrs) {
             Ok(win) => {
@@ -1189,6 +1407,36 @@ impl ApplicationHandler for VoxelApp {
                     r.resize(size);
                 }
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => {
+                if let Some(bridge) = &self.bridge {
+                    let eye = [
+                        f64::from(self.camera.position.x),
+                        f64::from(self.camera.position.y),
+                        f64::from(self.camera.position.z),
+                    ];
+                    let fwd = self.camera.forward();
+                    let dir = [f64::from(fwd.x), f64::from(fwd.y), f64::from(fwd.z)];
+                    match button {
+                        MouseButton::Left => {
+                            let _ = bridge.action_tx.send(ClientWindowAction::BreakLook {
+                                eye_pos: eye,
+                                look_dir: dir,
+                            });
+                        }
+                        MouseButton::Right => {
+                            let _ = bridge.action_tx.send(ClientWindowAction::PlaceLook {
+                                eye_pos: eye,
+                                look_dir: dir,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1204,7 +1452,7 @@ impl ApplicationHandler for VoxelApp {
                 }
                 if state == ElementState::Pressed {
                     let hotbar_key = match code {
-                        KeyCode::Digit1 => Some(0),
+                        KeyCode::Digit1 => Some(0usize),
                         KeyCode::Digit2 => Some(1),
                         KeyCode::Digit3 => Some(2),
                         KeyCode::Digit4 => Some(3),
@@ -1215,8 +1463,15 @@ impl ApplicationHandler for VoxelApp {
                         KeyCode::Digit9 => Some(8),
                         _ => None,
                     };
-                    if let (Some(slot), Some(r)) = (hotbar_key, &mut self.renderer) {
-                        r.set_selected_slot(slot);
+                    if let Some(slot) = hotbar_key {
+                        if let Some(r) = &mut self.renderer {
+                            r.set_selected_slot(slot);
+                        }
+                        if let Some(b) = &self.bridge {
+                            let _ = b
+                                .action_tx
+                                .send(ClientWindowAction::SelectHotbarSlot(slot as u16));
+                        }
                     }
                 }
                 match state {
@@ -1232,6 +1487,33 @@ impl ApplicationHandler for VoxelApp {
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
+
+                // Drain any non-blocking live server scene updates
+                if let Some(bridge) = &self.bridge {
+                    while let Ok(update) = bridge.scene_rx.try_recv() {
+                        match update {
+                            RenderSceneUpdate::ReplaceSections(secs) => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.upload_sections(&secs);
+                                }
+                            }
+                            RenderSceneUpdate::RemotePlayers(players) => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.upload_remote_players(&players);
+                                }
+                            }
+                            RenderSceneUpdate::TeleportCamera {
+                                position,
+                                yaw_rad,
+                                pitch_rad,
+                            } => {
+                                self.camera.position = position;
+                                self.camera.yaw_rad = yaw_rad;
+                                self.camera.pitch_rad = pitch_rad;
+                            }
+                        }
+                    }
+                }
 
                 let speed = if self.pressed_keys.contains(&KeyCode::ControlLeft) {
                     28.0
@@ -1274,6 +1556,24 @@ impl ApplicationHandler for VoxelApp {
                     self.camera.position.y -= speed * dt;
                 }
 
+                // Stream 20 Hz movement updates to server
+                self.net_move_accum += dt;
+                if self.net_move_accum >= 0.05 {
+                    self.net_move_accum = 0.0;
+                    if let Some(bridge) = &self.bridge {
+                        let _ = bridge.action_tx.send(ClientWindowAction::Move {
+                            feet_pos: [
+                                f64::from(self.camera.position.x),
+                                f64::from(self.camera.position.y) - 1.62,
+                                f64::from(self.camera.position.z),
+                            ],
+                            yaw_deg: self.camera.yaw_rad.to_degrees(),
+                            pitch_deg: self.camera.pitch_rad.to_degrees(),
+                            on_ground: false,
+                        });
+                    }
+                }
+
                 if let Some(r) = &mut self.renderer {
                     match r.render(&self.camera) {
                         Ok(()) => {}
@@ -1286,6 +1586,32 @@ impl ApplicationHandler for VoxelApp {
                         Err(err) => tracing::warn!(?err, "wgpu surface error"),
                     }
                 }
+
+                // Live FPS & MSPT profiler HUD in window title bar
+                self.fps_frames += 1;
+                self.fps_timer += dt;
+                if self.fps_timer >= 0.5 {
+                    let fps = (self.fps_frames as f32 / self.fps_timer).round() as u32;
+                    let ms = (self.fps_timer * 1000.0) / (self.fps_frames.max(1) as f32);
+                    if let (Some(w), Some(r)) = (&self.window, &self.renderer) {
+                        let (vis, tot, pcnt, mdi) = r.draw_stats();
+                        let mode = if mdi { "MDI" } else { "MegaBatch" };
+                        w.set_title(&format!(
+                            "{} | {} FPS ({:.2} ms) | {}: {}/{} secs | Players: {} | Slot: {}",
+                            self.base_title,
+                            fps,
+                            ms,
+                            mode,
+                            vis,
+                            tot,
+                            pcnt,
+                            r.selected_slot() + 1
+                        ));
+                    }
+                    self.fps_frames = 0;
+                    self.fps_timer = 0.0;
+                }
+
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -1295,26 +1621,31 @@ impl ApplicationHandler for VoxelApp {
     }
 }
 
-/// Opens the native `winit` + `wgpu` 3D voxel window with texture array, remote players, and HUD.
+/// Opens the native `winit` + `wgpu` 3D voxel window with Mega-Buffer MDI, live multiplayer bridge, and HUD.
 pub fn run_voxel_window(
     title: impl Into<String>,
     atlas: BlockTextureAtlas,
     camera: VoxelCamera,
     sections: Vec<WorldSectionMesh>,
     remote_players: Vec<RemotePlayerVisual>,
+    bridge: Option<LiveRenderBridge>,
 ) -> Result<()> {
     let event_loop = EventLoop::new().context("create winit event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = VoxelApp {
-        window_title: title.into(),
+        base_title: title.into(),
         atlas,
         initial_sections: sections,
         initial_players: remote_players,
+        bridge,
         camera,
         window: None,
         renderer: None,
         pressed_keys: HashSet::new(),
         last_frame: Instant::now(),
+        net_move_accum: 0.0,
+        fps_timer: 0.0,
+        fps_frames: 0,
     };
     event_loop.run_app(&mut app).context("run winit event loop")
 }
@@ -1322,6 +1653,8 @@ pub fn run_voxel_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ground_world::ChunkSection;
+    use ground_world::mesh::mesh_section;
 
     #[test]
     fn frustum_culls_chunks_behind_camera_and_keeps_visible_chunks() {
@@ -1343,13 +1676,48 @@ mod tests {
     }
 
     #[test]
+    fn mega_buffer_packs_sections_and_generates_frustum_culled_indirect_draws() {
+        let mut s0 = ChunkSection::new_air();
+        s0.set(1, 1, 1, generated_blocks::default_state::STONE);
+        let m0 = mesh_section(&s0);
+
+        let sections = vec![
+            WorldSectionMesh {
+                origin: Vec3::new(32.0, 0.0, 0.0), // in front (+X)
+                mesh: m0.clone(),
+            },
+            WorldSectionMesh {
+                origin: Vec3::new(-64.0, 0.0, 0.0), // behind (-X)
+                mesh: m0,
+            },
+        ];
+        let packed = pack_mega_mesh_batch(&sections);
+        assert_eq!(packed.slots.len(), 2);
+        assert_eq!(packed.slots[0].cmd.base_vertex, 0);
+        assert_eq!(packed.slots[0].cmd.first_instance, 0);
+        assert_eq!(packed.slots[1].cmd.base_vertex, 24);
+        assert_eq!(packed.slots[1].cmd.first_instance, 1);
+
+        let cam = VoxelCamera {
+            position: Vec3::ZERO,
+            yaw_rad: 0.0,
+            pitch_rad: 0.0,
+            ..Default::default()
+        };
+        let frustum = Frustum::from_view_proj(cam.view_proj_matrix());
+        let mut visible = Vec::new();
+        build_frustum_culled_indirect_cmds(&packed.slots, &frustum, &mut visible);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].first_instance, 0);
+    }
+
+    #[test]
     fn remote_player_and_hud_meshes_generate_expected_primitives() {
         let (p_verts, p_idx) = build_remote_players_mesh(&[RemotePlayerVisual {
             entity_id: 7,
             feet_pos: Vec3::new(8.0, -58.0, 8.0),
             yaw_deg: 45.0,
         }]);
-        // 6 articulated limbs * 6 faces * 4 verts = 144 verts, 216 indices
         assert_eq!(p_verts.len(), 144);
         assert_eq!(p_idx.len(), 216);
 
