@@ -4,6 +4,7 @@
 pub mod assets;
 pub mod generated_blocks;
 pub mod mesh;
+pub mod physics;
 
 use ground_protocol::buf::PacketReader;
 use ground_protocol::error::{ProtocolError, ProtocolResult};

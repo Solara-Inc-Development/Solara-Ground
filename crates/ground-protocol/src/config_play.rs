@@ -197,6 +197,133 @@ impl PlayerSpawnTransform {
     }
 }
 
+/// Encodes `ServerboundMovePlayerPacket.PosRot` (`x, y, z, yaw, pitch, flags`).
+pub fn encode_move_player_pos_rot(
+    pos: [f64; 3],
+    yaw_deg: f32,
+    pitch_deg: f32,
+    on_ground: bool,
+) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(33);
+    w.write_f64(pos[0]);
+    w.write_f64(pos[1]);
+    w.write_f64(pos[2]);
+    w.write_f32(yaw_deg);
+    w.write_f32(pitch_deg);
+    w.write_u8(u8::from(on_ground));
+    w.into_inner()
+}
+
+/// Encodes `ServerboundSetCarriedItemPacket` (`slot` in `0..=8`).
+pub fn encode_set_carried_item(slot: u16) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(2);
+    w.write_u16(slot);
+    w.into_inner()
+}
+
+/// Encodes `ServerboundPlayerActionPacket` (`START_DESTROY_BLOCK = 0`).
+pub fn encode_start_destroy_block(
+    block_pos: (i32, i32, i32),
+    face_direction: u8,
+    sequence: i32,
+) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(16);
+    w.write_varint(0); // START_DESTROY_BLOCK
+    w.write_block_pos(block_pos.0, block_pos.1, block_pos.2);
+    w.write_u8(face_direction);
+    w.write_varint(sequence);
+    w.into_inner()
+}
+
+/// Encodes `ServerboundUseItemOnPacket` (main hand block placement against `block_pos` / `face_direction`).
+pub fn encode_use_item_on(
+    block_pos: (i32, i32, i32),
+    face_direction: i32,
+    sequence: i32,
+) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(32);
+    w.write_varint(0); // InteractionHand::MAIN_HAND
+    w.write_block_pos(block_pos.0, block_pos.1, block_pos.2);
+    w.write_varint(face_direction);
+    w.write_f32(0.5);
+    w.write_f32(0.5);
+    w.write_f32(0.5);
+    w.write_bool(false); // inside
+    w.write_bool(false); // worldBorderHit
+    w.write_varint(sequence);
+    w.into_inner()
+}
+
+/// Encodes `ServerboundChatCommandPacket` (without leading `/`).
+pub fn encode_chat_command(command: &str) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(4 + command.len());
+    w.write_string(command.trim_start_matches('/'));
+    w.into_inner()
+}
+
+/// Decoded live Play-state server event processed during gameplay.
+#[derive(Debug, Clone)]
+pub enum PlayServerEvent {
+    BlockUpdate { pos: (i32, i32, i32), state_id: u32 },
+    SystemChat { text: String, overlay: bool },
+    Teleport(PlayerSpawnTransform),
+    BlockChangedAck(i32),
+    Other(i32),
+}
+
+/// Reads the next Play-state packet, automatically replying to `KeepAlive` and `Ping`.
+pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult<PlayServerEvent> {
+    use generated_packets::play::{clientbound as s2c, serverbound as c2s};
+
+    loop {
+        let (pkt_id, payload) = conn.read_packet().await?;
+        match pkt_id {
+            s2c::KEEP_ALIVE => {
+                conn.send_packet(c2s::KEEP_ALIVE, &payload).await?;
+            }
+            s2c::PING => {
+                conn.send_packet(c2s::PONG, &payload).await?;
+            }
+            s2c::BLOCK_UPDATE => {
+                let mut r = PacketReader::new(&payload);
+                let pos = r.read_block_pos()?;
+                let state_id = r.read_varint()? as u32;
+                return Ok(PlayServerEvent::BlockUpdate { pos, state_id });
+            }
+            s2c::SYSTEM_CHAT => {
+                let mut r = PacketReader::new(&payload);
+                let tag = read_network_nbt(&mut r)?;
+                let overlay = r.read_bool()?;
+                let text = match &tag {
+                    crate::nbt::NbtTag::String(s) => s.clone(),
+                    crate::nbt::NbtTag::Compound(entries) => entries
+                        .iter()
+                        .find(|(k, _)| k == "text")
+                        .and_then(|(_, v)| match v {
+                            crate::nbt::NbtTag::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| format!("{tag:?}")),
+                    _ => format!("{tag:?}"),
+                };
+                return Ok(PlayServerEvent::SystemChat { text, overlay });
+            }
+            s2c::PLAYER_POSITION => {
+                let mut r = PacketReader::new(&payload);
+                let tp = PlayerSpawnTransform::decode(&mut r)?;
+                conn.send_packet(c2s::ACCEPT_TELEPORTATION, &tp.encode_accept())
+                    .await?;
+                return Ok(PlayServerEvent::Teleport(tp));
+            }
+            s2c::BLOCK_CHANGED_ACK => {
+                let mut r = PacketReader::new(&payload);
+                return Ok(PlayServerEvent::BlockChangedAck(r.read_varint()?));
+            }
+            other => return Ok(PlayServerEvent::Other(other)),
+        }
+    }
+}
+
 /// Snapshot of initial `Play` state data received upon joining a server (`Login` + initial chunks + spawn position).
 #[derive(Debug)]
 pub struct InitialPlayBootstrap {
