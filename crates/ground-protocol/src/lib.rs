@@ -1,7 +1,9 @@
-//! Minecraft: Java Edition 26.3 (protocol 777) client protocol primitives, online auth, and ping.
+//! Minecraft: Java Edition 26.3 (protocol 777) client protocol primitives, online auth,
+//! Configuration/Play state handlers, and Server List Ping.
 
 pub mod buf;
 pub mod client;
+pub mod config_play;
 pub mod crypto;
 pub mod error;
 pub mod frame;

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Strictly non-default local testing feature (never enabled in release distributions).
+dev-offline = []
+
 [dependencies]
 aes.workspace = true
 bytes.workspace = true

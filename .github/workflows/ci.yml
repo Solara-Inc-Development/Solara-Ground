@@ -40,9 +40,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Clippy (Default Online-Only & All Features)
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run Tests
-        run: cargo test --workspace --verbose
-      - name: Build Binary
+        run: cargo test --workspace --all-features --verbose
+      - name: Build Release-Safe Default Binary
         run: cargo build --bin solara-ground

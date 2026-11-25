@@ -8,9 +8,14 @@ license.workspace = true
 name = "solara-ground"
 path = "src/main.rs"
 
+[features]
+default = []
+dev-offline = ["ground-protocol/dev-offline"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+glam.workspace = true
 ground-protocol.workspace = true
 ground-render.workspace = true
 ground-world.workspace = true

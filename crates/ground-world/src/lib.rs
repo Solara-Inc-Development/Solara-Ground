@@ -1,5 +1,7 @@
-//! Client-side bit-packed paletted chunk sections, network chunk decoding, and voxel meshing.
+//! Client-side bit-packed paletted chunk sections, MC 26.3 network chunk decoding,
+//! Mojang local asset resolution, and compact voxel meshing.
 
+pub mod assets;
 pub mod generated_blocks;
 pub mod mesh;
 
@@ -8,6 +10,14 @@ use ground_protocol::error::{ProtocolError, ProtocolResult};
 
 pub const SECTION_SIDE: usize = 16;
 pub const SECTION_VOLUME: usize = SECTION_SIDE * SECTION_SIDE * SECTION_SIDE; // 4096
+pub const OVERWORLD_MIN_Y: i32 = -64;
+pub const OVERWORLD_SECTIONS: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkPos {
+    pub x: i32,
+    pub z: i32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitStorage {
@@ -155,39 +165,45 @@ impl PalettedBlocks {
         }
     }
 
-    /// Decodes a Minecraft 1.18+ / 26.3 paletted block container from a chunk section packet.
-    pub fn read_network(r: &mut PacketReader<'_>) -> ProtocolResult<Self> {
+    /// Decodes a Minecraft 26.3 `PalettedContainer` (`writeFixedSizeLongArray`, no VarInt length prefix).
+    pub fn read_network_container(
+        r: &mut PacketReader<'_>,
+        volume: usize,
+        max_indirect_bits: u8,
+    ) -> ProtocolResult<Self> {
         let bits = r.read_u8()?;
         if bits == 0 {
             let single = r.read_varint()? as u32;
-            let long_len = r.read_usize_bounded(16)?;
-            for _ in 0..long_len {
-                let _ = r.read_i64()?;
-            }
             return Ok(Self::Single(single));
         }
 
-        let effective_bits = bits.max(4);
-        if effective_bits <= 8 {
+        let entries_per_long = 64 / usize::from(bits);
+        if entries_per_long == 0 {
+            return Err(ProtocolError::LengthTooLarge {
+                len: usize::from(bits),
+                max: 32,
+            });
+        }
+        let long_count = volume.div_ceil(entries_per_long);
+
+        if bits <= max_indirect_bits {
             let pal_len = r.read_usize_bounded(512)?;
             let mut palette = Vec::with_capacity(pal_len);
             for _ in 0..pal_len {
                 palette.push(r.read_varint()? as u32);
             }
-            let long_count = r.read_usize_bounded(1024)?;
             let mut longs = Vec::with_capacity(long_count);
             for _ in 0..long_count {
                 longs.push(r.read_i64()? as u64);
             }
-            let storage = BitStorage::from_longs(effective_bits, SECTION_VOLUME, longs)?;
+            let storage = BitStorage::from_longs(bits, volume, longs)?;
             Ok(Self::Indirect { palette, storage })
         } else {
-            let long_count = r.read_usize_bounded(2048)?;
             let mut longs = Vec::with_capacity(long_count);
             for _ in 0..long_count {
                 longs.push(r.read_i64()? as u64);
             }
-            let storage = BitStorage::from_longs(effective_bits, SECTION_VOLUME, longs)?;
+            let storage = BitStorage::from_longs(bits, volume, longs)?;
             Ok(Self::Direct { storage })
         }
     }
@@ -246,4 +262,44 @@ impl ChunkSection {
         }
         self.blocks.set(idx, state_id);
     }
+
+    /// Decodes a single MC 26.3 `LevelChunkSection`:
+    /// `i16 nonEmptyBlockCount`, `i16 fluidCount`, `PalettedContainer(4096) states`, `PalettedContainer(64) biomes`.
+    pub fn read_network(r: &mut PacketReader<'_>) -> ProtocolResult<Self> {
+        let non_air_raw = r.read_i16()?;
+        let _fluid_raw = r.read_i16()?;
+        let blocks = PalettedBlocks::read_network_container(r, SECTION_VOLUME, 8)?;
+        let _biomes = PalettedBlocks::read_network_container(r, 64, 3)?;
+        Ok(Self {
+            non_air_blocks: non_air_raw.max(0) as u16,
+            blocks,
+        })
+    }
+}
+
+/// Decodes a full `ClientboundLevelChunkWithLightPacket` payload into `(ChunkPos, Vec<ChunkSection>)`.
+pub fn decode_level_chunk_with_light(
+    payload: &[u8],
+    section_count: usize,
+) -> ProtocolResult<(ChunkPos, Vec<ChunkSection>)> {
+    let mut r = PacketReader::new(payload);
+    let cx = r.read_i32()?;
+    let cz = r.read_i32()?;
+
+    // Skip HEIGHTMAPS_STREAM_CODEC: Map<VarInt, LongArray>
+    let hm_count = r.read_usize_bounded(16)?;
+    for _ in 0..hm_count {
+        let _hm_type = r.read_varint()?;
+        let longs_len = r.read_usize_bounded(512)?;
+        let _ = r.read_exact(longs_len * 8)?;
+    }
+
+    let chunk_bytes = r.read_byte_array(2 * 1024 * 1024)?;
+    let mut sr = PacketReader::new(&chunk_bytes);
+    let mut sections = Vec::with_capacity(section_count);
+    for _ in 0..section_count {
+        sections.push(ChunkSection::read_network(&mut sr)?);
+    }
+
+    Ok((ChunkPos { x: cx, z: cz }, sections))
 }

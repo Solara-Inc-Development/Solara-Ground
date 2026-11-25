@@ -1,3 +1,4 @@
+use crate::assets::procedural_block_color;
 use crate::{ChunkSection, SECTION_SIDE, generated_blocks};
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
@@ -12,9 +13,9 @@ use rayon::prelude::*;
 ///   - bits `15..=17`: normal direction (`0..6`: `-X, +X, -Y, +Y, -Z, +Z`)
 ///   - bits `18..=19`: ambient occlusion level (`0..=3`)
 ///   - bits `20..=27`: packed sky/block light (`(sky << 4) | block`)
+///   - bits `28..=29`: quad corner UV index (`0..=3`)
 /// - `word1`:
-///   - bits `0..=15`: block state / texture atlas sprite ID
-///   - bits `16..=17`: quad corner index (`0..=3`)
+///   - packed `RGBA8` albedo color (`r | (g << 8) | (b << 16) | (a << 24)`)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct PackedVoxelVertex {
@@ -31,8 +32,8 @@ impl PackedVoxelVertex {
         face: FaceDir,
         ao: u8,
         light: u8,
-        sprite_id: u16,
         corner: u8,
+        rgba: [u8; 4],
     ) -> Self {
         let [x, y, z] = pos;
         let w0 = (x as u32 & 0x1F)
@@ -40,8 +41,12 @@ impl PackedVoxelVertex {
             | ((z as u32 & 0x1F) << 10)
             | ((face as u32 & 0x07) << 15)
             | ((ao as u32 & 0x03) << 18)
-            | ((light as u32) << 20);
-        let w1 = (sprite_id as u32) | (((corner as u32) & 0x03) << 16);
+            | ((light as u32) << 20)
+            | (((corner as u32) & 0x03) << 28);
+        let w1 = (rgba[0] as u32)
+            | ((rgba[1] as u32) << 8)
+            | ((rgba[2] as u32) << 16)
+            | ((rgba[3] as u32) << 24);
         Self {
             word0: w0,
             word1: w1,
@@ -150,7 +155,6 @@ pub fn mesh_section(section: &ChunkSection) -> SectionMesh {
                 if generated_blocks::is_air_state(state) {
                     continue;
                 }
-                let sprite_id = (state & 0xFFFF) as u16;
 
                 for face in FaceDir::ALL {
                     let (dx, dy, dz) = face.offset();
@@ -167,6 +171,7 @@ pub fn mesh_section(section: &ChunkSection) -> SectionMesh {
                         continue;
                     }
 
+                    let rgba = procedural_block_color(state, face == FaceDir::PosY);
                     let base = mesh.vertices.len() as u32;
                     let corners = face.quad_corners(x as u8, y as u8, z as u8);
                     for (corner_idx, &(cx, cy, cz)) in corners.iter().enumerate() {
@@ -175,8 +180,8 @@ pub fn mesh_section(section: &ChunkSection) -> SectionMesh {
                             face,
                             3,
                             0xF0,
-                            sprite_id,
                             corner_idx as u8,
+                            rgba,
                         ));
                     }
                     mesh.indices.extend_from_slice(&[
@@ -221,7 +226,6 @@ mod tests {
         assert_eq!(m1.vertices.len(), 24);
         assert_eq!(m1.indices.len(), 36);
 
-        // 2x2x2 cube of 8 stone blocks: 8 * 6 = 48 raw faces, 24 interior faces culled -> 24 exterior faces!
         let mut cube = ChunkSection::new_air();
         for dx in 0..2 {
             for dy in 0..2 {

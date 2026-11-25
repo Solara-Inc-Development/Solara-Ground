@@ -286,3 +286,56 @@ pub async fn login_online(
         }
     }
 }
+
+/// Development-only offline login helper (compiled strictly when the non-default `dev-offline`
+/// feature is explicitly enabled for local integration tests; never included in release builds).
+#[cfg(feature = "dev-offline")]
+pub async fn login_dev_offline(
+    host: &str,
+    port: u16,
+    username: &str,
+) -> ProtocolResult<(ClientConnection, LoginFinishedS2c)> {
+    let mut conn = ClientConnection::connect(host, port).await?;
+    let hs = HandshakeC2s {
+        protocol_version: PROTOCOL_VERSION,
+        server_address: host.to_owned(),
+        server_port: port,
+        intent: ClientIntent::Login,
+    };
+    conn.send_packet(HandshakeC2s::PACKET_ID, &hs.encode())
+        .await?;
+
+    let hello = LoginHelloC2s {
+        username: username.to_owned(),
+        profile_id: Uuid::nil(),
+    };
+    conn.send_packet(LoginHelloC2s::PACKET_ID, &hello.encode())
+        .await?;
+
+    loop {
+        let (pkt_id, payload) = conn.read_packet().await?;
+        match pkt_id {
+            generated_packets::login::clientbound::LOGIN_DISCONNECT => {
+                let mut r = PacketReader::new(&payload);
+                return Err(ProtocolError::ServerDisconnect(decode_disconnect_reason(
+                    &mut r,
+                )?));
+            }
+            generated_packets::login::clientbound::LOGIN_COMPRESSION => {
+                let mut r = PacketReader::new(&payload);
+                conn.set_compression(r.read_varint()?);
+            }
+            generated_packets::login::clientbound::LOGIN_FINISHED => {
+                let mut r = PacketReader::new(&payload);
+                let finished = LoginFinishedS2c::decode(&mut r)?;
+                conn.send_packet(
+                    generated_packets::login::serverbound::LOGIN_ACKNOWLEDGED,
+                    &[],
+                )
+                .await?;
+                return Ok((conn, finished));
+            }
+            other => return Err(ProtocolError::UnexpectedPacketId(other)),
+        }
+    }
+}

@@ -30,6 +30,12 @@ cargo test --workspace
 cargo run --bin solara-ground -- --ping 127.0.0.1:25565
 ```
 
-## License
+## Assets & Mojang EULA Compliance
+
+`Solara-Ground` is a clean-room native Rust client and **does not bundle, host, or redistribute any Mojang code or game assets**. Official Minecraft assets (textures, sounds, models) are downloaded directly from Mojang's official servers onto the player's machine by **Solara Launcher** after authenticating a legitimate paid Microsoft/Minecraft account, while only Solara's own Rust client files are delivered from Solara's servers / GitHub Releases.
+
+## License & Legal Notice
 
 Licensed under the **GNU General Public License v3.0** — see [LICENSE](./LICENSE).
+
+> **NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.**

@@ -885,6 +885,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
+ "glam",
  "ground-protocol",
  "ground-render",
  "ground-world",
@@ -936,6 +937,8 @@ dependencies = [
  "bytemuck",
  "ground-protocol",
  "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
