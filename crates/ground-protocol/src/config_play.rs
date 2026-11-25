@@ -6,6 +6,10 @@ use crate::client::ClientConnection;
 use crate::error::{ProtocolError, ProtocolResult};
 use crate::generated_packets;
 use crate::nbt::read_network_nbt;
+use uuid::Uuid;
+
+/// Official `minecraft:player` protocol ID in `minecraft:entity_type` for MC 26.3 (`777`).
+pub const ENTITY_TYPE_PLAYER: i32 = 159;
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigurationSummary {
@@ -97,9 +101,7 @@ pub async fn complete_configuration(
                 conn.send_packet(c2s::FINISH_CONFIGURATION, &[]).await?;
                 return Ok(summary);
             }
-            _ => {
-                // Custom payloads, feature flags, server links, etc.
-            }
+            _ => {}
         }
     }
 }
@@ -197,6 +199,182 @@ impl PlayerSpawnTransform {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RemotePlayerInfo {
+    pub uuid: Uuid,
+    pub username: Option<String>,
+    pub game_mode: Option<u8>,
+    pub latency_ms: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteEntitySpawn {
+    pub entity_id: i32,
+    pub uuid: Uuid,
+    pub entity_type: i32,
+    pub position: [f64; 3],
+    pub yaw_deg: f32,
+    pub pitch_deg: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteEntityTeleport {
+    pub entity_id: i32,
+    pub position: [f64; 3],
+    pub yaw_deg: f32,
+    pub pitch_deg: f32,
+    pub on_ground: bool,
+}
+
+fn skip_lp_vec3(r: &mut PacketReader<'_>) -> ProtocolResult<()> {
+    let b0 = r.read_u8()?;
+    if b0 == 0 {
+        return Ok(());
+    }
+    let _b1 = r.read_u8()?;
+    let _b2 = r.read_i32()?;
+    if (b0 & 0x04) != 0 {
+        let _scale = r.read_varlong()?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn angle_byte_to_deg(b: i8) -> f32 {
+    (f32::from(b as u8) * 360.0) / 256.0
+}
+
+pub fn decode_player_info_update(
+    r: &mut PacketReader<'_>,
+) -> ProtocolResult<Vec<RemotePlayerInfo>> {
+    let actions = r.read_u8()?;
+    let count = r.read_usize_bounded(4096)?;
+    let mut out = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let uuid = r.read_uuid()?;
+        let mut username = None;
+        let mut game_mode = None;
+        let mut latency_ms = None;
+
+        // Bit 0: ADD_PLAYER
+        if (actions & 0x01) != 0 {
+            username = Some(r.read_string(16)?);
+            let prop_count = r.read_usize_bounded(64)?;
+            for _ in 0..prop_count {
+                let _name = r.read_string(64)?;
+                let _val = r.read_string(32767)?;
+                if r.read_bool()? {
+                    let _sig = r.read_string(1024)?;
+                }
+            }
+        }
+        // Bit 1: INITIALIZE_CHAT
+        if (actions & 0x02) != 0 && r.read_bool()? {
+            let _chat_session_id = r.read_uuid()?;
+            let _expires_at = r.read_i64()?;
+            let _pub_key = r.read_byte_array(512)?;
+            let _key_sig = r.read_byte_array(4096)?;
+        }
+        // Bit 2: UPDATE_GAME_MODE
+        if (actions & 0x04) != 0 {
+            game_mode = Some(r.read_varint()? as u8);
+        }
+        // Bit 3: UPDATE_LISTED
+        if (actions & 0x08) != 0 {
+            let _listed = r.read_bool()?;
+        }
+        // Bit 4: UPDATE_LATENCY
+        if (actions & 0x10) != 0 {
+            latency_ms = Some(r.read_varint()?);
+        }
+        // Bit 5: UPDATE_DISPLAY_NAME
+        if (actions & 0x20) != 0 && r.read_bool()? {
+            let _display_nbt = read_network_nbt(r)?;
+        }
+        // Bit 6: UPDATE_LIST_ORDER
+        if (actions & 0x40) != 0 {
+            let _order = r.read_varint()?;
+        }
+        // Bit 7: UPDATE_HAT
+        if (actions & 0x80) != 0 {
+            let _hat = r.read_bool()?;
+        }
+
+        out.push(RemotePlayerInfo {
+            uuid,
+            username,
+            game_mode,
+            latency_ms,
+        });
+    }
+    Ok(out)
+}
+
+pub fn decode_player_info_remove(r: &mut PacketReader<'_>) -> ProtocolResult<Vec<Uuid>> {
+    let count = r.read_usize_bounded(4096)?;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(r.read_uuid()?);
+    }
+    Ok(out)
+}
+
+pub fn decode_add_entity(r: &mut PacketReader<'_>) -> ProtocolResult<RemoteEntitySpawn> {
+    let entity_id = r.read_varint()?;
+    let uuid = r.read_uuid()?;
+    let entity_type = r.read_varint()?;
+    let x = r.read_f64()?;
+    let y = r.read_f64()?;
+    let z = r.read_f64()?;
+    let (pitch_deg, yaw_deg) = if r.remaining() >= 3 {
+        skip_lp_vec3(r)?;
+        let pitch = angle_byte_to_deg(r.read_i8()?);
+        let yaw = angle_byte_to_deg(r.read_i8()?);
+        (pitch, yaw)
+    } else {
+        (0.0, 0.0)
+    };
+    Ok(RemoteEntitySpawn {
+        entity_id,
+        uuid,
+        entity_type,
+        position: [x, y, z],
+        yaw_deg,
+        pitch_deg,
+    })
+}
+
+pub fn decode_teleport_entity(r: &mut PacketReader<'_>) -> ProtocolResult<RemoteEntityTeleport> {
+    let entity_id = r.read_varint()?;
+    let x = r.read_f64()?;
+    let y = r.read_f64()?;
+    let z = r.read_f64()?;
+    let _dx = r.read_f64()?;
+    let _dy = r.read_f64()?;
+    let _dz = r.read_f64()?;
+    let yaw_deg = r.read_f32()?;
+    let pitch_deg = r.read_f32()?;
+    let _relatives = r.read_i32()?;
+    let on_ground = r.read_bool()?;
+    Ok(RemoteEntityTeleport {
+        entity_id,
+        position: [x, y, z],
+        yaw_deg,
+        pitch_deg,
+        on_ground,
+    })
+}
+
+pub fn decode_remove_entities(r: &mut PacketReader<'_>) -> ProtocolResult<Vec<i32>> {
+    let count = r.read_usize_bounded(4096)?;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(r.read_varint()?);
+    }
+    Ok(ids)
+}
+
 /// Encodes `ServerboundMovePlayerPacket.PosRot` (`x, y, z, yaw, pitch, flags`).
 pub fn encode_move_player_pos_rot(
     pos: [f64; 3],
@@ -264,14 +442,20 @@ pub fn encode_chat_command(command: &str) -> Vec<u8> {
 /// Decoded live Play-state server event processed during gameplay.
 #[derive(Debug, Clone)]
 pub enum PlayServerEvent {
+    LevelChunkWithLight(Vec<u8>),
     BlockUpdate { pos: (i32, i32, i32), state_id: u32 },
     SystemChat { text: String, overlay: bool },
     Teleport(PlayerSpawnTransform),
     BlockChangedAck(i32),
+    PlayerInfoUpdate(Vec<RemotePlayerInfo>),
+    PlayerInfoRemove(Vec<Uuid>),
+    AddEntity(RemoteEntitySpawn),
+    TeleportEntity(RemoteEntityTeleport),
+    RemoveEntities(Vec<i32>),
     Other(i32),
 }
 
-/// Reads the next Play-state packet, automatically replying to `KeepAlive` and `Ping`.
+/// Reads the next Play-state packet, automatically replying to `KeepAlive`, `Ping`, and `ChunkBatchFinished`.
 pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult<PlayServerEvent> {
     use generated_packets::play::{clientbound as s2c, serverbound as c2s};
 
@@ -283,6 +467,15 @@ pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult
             }
             s2c::PING => {
                 conn.send_packet(c2s::PONG, &payload).await?;
+            }
+            s2c::CHUNK_BATCH_FINISHED => {
+                let mut w = PacketWriter::with_capacity(4);
+                w.write_f32(25.0);
+                conn.send_packet(c2s::CHUNK_BATCH_RECEIVED, w.as_slice())
+                    .await?;
+            }
+            s2c::LEVEL_CHUNK_WITH_LIGHT => {
+                return Ok(PlayServerEvent::LevelChunkWithLight(payload));
             }
             s2c::BLOCK_UPDATE => {
                 let mut r = PacketReader::new(&payload);
@@ -319,21 +512,52 @@ pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult
                 let mut r = PacketReader::new(&payload);
                 return Ok(PlayServerEvent::BlockChangedAck(r.read_varint()?));
             }
+            s2c::PLAYER_INFO_UPDATE => {
+                let mut r = PacketReader::new(&payload);
+                return Ok(PlayServerEvent::PlayerInfoUpdate(
+                    decode_player_info_update(&mut r)?,
+                ));
+            }
+            s2c::PLAYER_INFO_REMOVE => {
+                let mut r = PacketReader::new(&payload);
+                return Ok(PlayServerEvent::PlayerInfoRemove(
+                    decode_player_info_remove(&mut r)?,
+                ));
+            }
+            s2c::ADD_ENTITY => {
+                let mut r = PacketReader::new(&payload);
+                return Ok(PlayServerEvent::AddEntity(decode_add_entity(&mut r)?));
+            }
+            s2c::TELEPORT_ENTITY => {
+                let mut r = PacketReader::new(&payload);
+                return Ok(PlayServerEvent::TeleportEntity(decode_teleport_entity(
+                    &mut r,
+                )?));
+            }
+            s2c::REMOVE_ENTITIES => {
+                let mut r = PacketReader::new(&payload);
+                return Ok(PlayServerEvent::RemoveEntities(decode_remove_entities(
+                    &mut r,
+                )?));
+            }
             other => return Ok(PlayServerEvent::Other(other)),
         }
     }
 }
 
-/// Snapshot of initial `Play` state data received upon joining a server (`Login` + initial chunks + spawn position).
+/// Snapshot of initial `Play` state data received upon joining a server
+/// (`Login` + initial chunks + tab-list players + already-online visible entities + spawn position).
 #[derive(Debug)]
 pub struct InitialPlayBootstrap {
     pub join_info: PlayJoinInfo,
     pub spawn: PlayerSpawnTransform,
     pub raw_chunk_packets: Vec<Vec<u8>>,
+    pub initial_players: Vec<RemotePlayerInfo>,
+    pub initial_entities: Vec<RemoteEntitySpawn>,
 }
 
-/// Collects the initial Play state login, streamed spawn chunks, and player spawn position,
-/// replying to `KeepAlive` and acknowledging the initial teleport.
+/// Collects the initial Play state login, streamed spawn chunks, initial players/entities,
+/// and player spawn position, replying to `KeepAlive` and acknowledging the initial teleport.
 pub async fn bootstrap_play_session(
     conn: &mut ClientConnection,
 ) -> ProtocolResult<InitialPlayBootstrap> {
@@ -341,6 +565,8 @@ pub async fn bootstrap_play_session(
 
     let mut join_info: Option<PlayJoinInfo> = None;
     let mut raw_chunk_packets = Vec::new();
+    let mut initial_players = Vec::new();
+    let mut initial_entities = Vec::new();
 
     loop {
         let (pkt_id, payload) = conn.read_packet().await?;
@@ -363,8 +589,15 @@ pub async fn bootstrap_play_session(
             s2c::LEVEL_CHUNK_WITH_LIGHT => {
                 raw_chunk_packets.push(payload);
             }
+            s2c::PLAYER_INFO_UPDATE => {
+                let mut r = PacketReader::new(&payload);
+                initial_players.extend(decode_player_info_update(&mut r)?);
+            }
+            s2c::ADD_ENTITY => {
+                let mut r = PacketReader::new(&payload);
+                initial_entities.push(decode_add_entity(&mut r)?);
+            }
             s2c::CHUNK_BATCH_FINISHED => {
-                // Acknowledge chunk batch with desired chunks/tick = 25.0
                 let mut w = PacketWriter::with_capacity(4);
                 w.write_f32(25.0);
                 conn.send_packet(c2s::CHUNK_BATCH_RECEIVED, w.as_slice())
@@ -383,6 +616,8 @@ pub async fn bootstrap_play_session(
                     join_info: info,
                     spawn,
                     raw_chunk_packets,
+                    initial_players,
+                    initial_entities,
                 });
             }
             _ => {}

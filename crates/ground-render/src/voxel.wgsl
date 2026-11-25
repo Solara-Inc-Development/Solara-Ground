@@ -9,6 +9,12 @@ struct SectionUniform {
 @group(0) @binding(0)
 var<uniform> u_camera: CameraUniform;
 
+@group(0) @binding(1)
+var t_blocks: texture_2d_array<f32>;
+
+@group(0) @binding(2)
+var s_blocks: sampler;
+
 @group(1) @binding(0)
 var<uniform> u_section: SectionUniform;
 
@@ -20,6 +26,7 @@ struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) @interpolate(flat) tex_layer: u32,
 };
 
 @vertex
@@ -32,14 +39,16 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let lz = f32((w0 >> 10u) & 0x1Fu);
     let face = (w0 >> 15u) & 0x07u;
     let ao_raw = f32((w0 >> 18u) & 0x03u);
-    let corner = (w0 >> 28u) & 0x03u;
+    let blk_light = f32((w0 >> 20u) & 0x0Fu) / 15.0;
+    let sky_light = f32((w0 >> 24u) & 0x0Fu) / 15.0;
+    let tex_layer = (w0 >> 28u) & 0x0Fu;
 
     let r = f32(w1 & 0xFFu) / 255.0;
     let g = f32((w1 >> 8u) & 0xFFu) / 255.0;
     let b = f32((w1 >> 16u) & 0xFFu) / 255.0;
     let a = f32((w1 >> 24u) & 0xFFu) / 255.0;
 
-    // Directional face sunlight matching classic Minecraft crisp voxel contrast
+    // Classic crisp directional Minecraft face shading
     var shade = 1.0;
     if (face == 2u) {
         shade = 0.52; // -Y bottom
@@ -48,30 +57,32 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     } else if (face == 4u || face == 5u) {
         shade = 0.70; // +/-Z north/south
     }
-    let ao = 0.55 + 0.15 * ao_raw;
+    let ao = 0.62 + 0.1266 * ao_raw;
+    let voxel_light = clamp(max(sky_light, blk_light * 0.96), 0.14, 1.0);
 
-    var corner_uv = vec2<f32>(0.0, 0.0);
-    if (corner == 1u) {
-        corner_uv = vec2<f32>(1.0, 0.0);
-    } else if (corner == 2u) {
-        corner_uv = vec2<f32>(1.0, 1.0);
-    } else if (corner == 3u) {
-        corner_uv = vec2<f32>(0.0, 1.0);
+    // World/section-space tiling UVs so greedy-merged (W x H) quads repeat 16x16 block tiles seamlessly!
+    var tile_uv = vec2<f32>(lx, lz);
+    if (face == 0u || face == 1u) {
+        tile_uv = vec2<f32>(lz, 16.0 - ly);
+    } else if (face == 4u || face == 5u) {
+        tile_uv = vec2<f32>(lx, 16.0 - ly);
     }
 
     let world_pos = u_section.origin.xyz + vec3<f32>(lx, ly, lz);
     var out: VertexOutput;
     out.clip_pos = u_camera.view_proj * vec4<f32>(world_pos, 1.0);
-    out.color = vec4<f32>(vec3<f32>(r, g, b) * shade * ao, a);
-    out.uv = corner_uv;
+    out.color = vec4<f32>(vec3<f32>(r, g, b) * shade * ao * voxel_light, a);
+    out.uv = tile_uv;
+    out.tex_layer = tex_layer;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Subtle crisp block border accent so adjacent identical blocks remain readable pre-atlas
-    let edge_dist = min(min(in.uv.x, 1.0 - in.uv.x), min(in.uv.y, 1.0 - in.uv.y));
-    let border = smoothstep(0.0, 0.04, edge_dist);
-    let rgb = in.color.rgb * (0.93 + 0.07 * border);
-    return vec4<f32>(rgb, in.color.a);
+    let texel = textureSample(t_blocks, s_blocks, in.uv, i32(in.tex_layer));
+    let out_alpha = texel.a * in.color.a;
+    if (out_alpha < 0.05) {
+        discard;
+    }
+    return vec4<f32>(texel.rgb * in.color.rgb, out_alpha);
 }

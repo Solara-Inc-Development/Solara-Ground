@@ -1,5 +1,5 @@
-//! Client-side bit-packed paletted chunk sections, MC 26.3 network chunk decoding,
-//! Mojang local asset resolution, and compact voxel meshing.
+//! Client-side bit-packed paletted chunk sections, MC 26.3 network chunk + light decoding,
+//! Mojang local asset resolution, and compact greedy voxel meshing.
 
 pub mod assets;
 pub mod generated_blocks;
@@ -8,11 +8,26 @@ pub mod physics;
 
 use ground_protocol::buf::PacketReader;
 use ground_protocol::error::{ProtocolError, ProtocolResult};
+use ground_protocol::nbt::read_network_nbt;
+use rayon::prelude::*;
 
 pub const SECTION_SIDE: usize = 16;
 pub const SECTION_VOLUME: usize = SECTION_SIDE * SECTION_SIDE * SECTION_SIDE; // 4096
 pub const OVERWORLD_MIN_Y: i32 = -64;
 pub const OVERWORLD_SECTIONS: usize = 24;
+
+/// Returns the number of active `rayon` CPU worker threads used for parallel chunk decoding & meshing.
+pub fn worker_threads() -> usize {
+    rayon::current_num_threads()
+}
+
+/// Decoded 24-section Overworld chunk column paired with its 2D greedy-meshed `SectionMesh`es.
+#[derive(Debug, Clone)]
+pub struct DecodedChunkColumn {
+    pub pos: ChunkPos,
+    pub sections: Vec<ChunkSection>,
+    pub meshes: Vec<mesh::SectionMesh>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkPos {
@@ -210,10 +225,50 @@ impl PalettedBlocks {
     }
 }
 
+/// Memory-compact 4-bit section light storage: avoids allocating `2048` bytes for uniform sections.
+#[derive(Debug, Clone)]
+pub enum SectionLight {
+    Uniform(u8),
+    Nibbles(Box<[u8; SECTION_VOLUME / 2]>),
+}
+
+impl SectionLight {
+    pub fn from_nibble_slice(bytes: &[u8]) -> Self {
+        if bytes.len() != SECTION_VOLUME / 2 {
+            return Self::Uniform(0);
+        }
+        let first = bytes[0];
+        let low = first & 0x0F;
+        if (first >> 4) == low && bytes.iter().all(|&b| b == first) {
+            return Self::Uniform(low);
+        }
+        let mut boxed = Box::new([0u8; SECTION_VOLUME / 2]);
+        boxed.copy_from_slice(bytes);
+        Self::Nibbles(boxed)
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> u8 {
+        match self {
+            Self::Uniform(v) => *v,
+            Self::Nibbles(arr) => {
+                let byte = arr[index >> 1];
+                if (index & 1) == 0 {
+                    byte & 0x0F
+                } else {
+                    byte >> 4
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChunkSection {
     non_air_blocks: u16,
     blocks: PalettedBlocks,
+    sky_light: SectionLight,
+    block_light: SectionLight,
 }
 
 impl Default for ChunkSection {
@@ -227,6 +282,8 @@ impl ChunkSection {
         Self {
             non_air_blocks: 0,
             blocks: PalettedBlocks::filled(generated_blocks::default_state::AIR),
+            sky_light: SectionLight::Uniform(15),
+            block_light: SectionLight::Uniform(0),
         }
     }
 
@@ -246,6 +303,37 @@ impl ChunkSection {
 
     pub fn get(&self, x: usize, y: usize, z: usize) -> u32 {
         self.blocks.get(Self::section_index(x, y, z))
+    }
+
+    #[inline]
+    pub fn sky_light(&self, x: usize, y: usize, z: usize) -> u8 {
+        self.sky_light.get(Self::section_index(x, y, z))
+    }
+
+    #[inline]
+    pub fn block_light(&self, x: usize, y: usize, z: usize) -> u8 {
+        self.block_light.get(Self::section_index(x, y, z))
+    }
+
+    #[inline]
+    pub fn is_uniform_dark_sky(&self) -> bool {
+        matches!(self.sky_light, SectionLight::Uniform(0))
+    }
+
+    pub fn set_sky_light_array(&mut self, bytes: &[u8]) {
+        self.sky_light = SectionLight::from_nibble_slice(bytes);
+    }
+
+    pub fn set_block_light_array(&mut self, bytes: &[u8]) {
+        self.block_light = SectionLight::from_nibble_slice(bytes);
+    }
+
+    pub fn set_uniform_sky(&mut self, level: u8) {
+        self.sky_light = SectionLight::Uniform(level & 0x0F);
+    }
+
+    pub fn set_uniform_block(&mut self, level: u8) {
+        self.block_light = SectionLight::Uniform(level & 0x0F);
     }
 
     pub fn set(&mut self, x: usize, y: usize, z: usize, state_id: u32) {
@@ -274,11 +362,30 @@ impl ChunkSection {
         Ok(Self {
             non_air_blocks: non_air_raw.max(0) as u16,
             blocks,
+            sky_light: SectionLight::Uniform(15),
+            block_light: SectionLight::Uniform(0),
         })
     }
 }
 
-/// Decodes a full `ClientboundLevelChunkWithLightPacket` payload into `(ChunkPos, Vec<ChunkSection>)`.
+fn read_bitset(r: &mut PacketReader<'_>) -> ProtocolResult<Vec<u64>> {
+    let word_count = r.read_usize_bounded(16)?;
+    let mut words = Vec::with_capacity(word_count);
+    for _ in 0..word_count {
+        words.push(r.read_i64()? as u64);
+    }
+    Ok(words)
+}
+
+#[inline]
+fn bitset_get(words: &[u64], bit: usize) -> bool {
+    words
+        .get(bit >> 6)
+        .is_some_and(|w| ((w >> (bit & 63)) & 1) != 0)
+}
+
+/// Decodes a full `ClientboundLevelChunkWithLightPacket` payload into `(ChunkPos, Vec<ChunkSection>)`,
+/// including block-entity skipping and 4-bit Sky & Block light nibble arrays.
 pub fn decode_level_chunk_with_light(
     payload: &[u8],
     section_count: usize,
@@ -302,5 +409,93 @@ pub fn decode_level_chunk_with_light(
         sections.push(ChunkSection::read_network(&mut sr)?);
     }
 
+    // Skip List<BlockEntityInfo>
+    let be_count = r.read_usize_bounded(4096)?;
+    for _ in 0..be_count {
+        let _packed_xz = r.read_u8()?;
+        let _y = r.read_i16()?;
+        let _be_type = r.read_varint()?;
+        let _optional_nbt = read_network_nbt(&mut r)?;
+    }
+
+    if r.remaining() > 0 {
+        let sky_mask = read_bitset(&mut r)?;
+        let block_mask = read_bitset(&mut r)?;
+        let empty_sky_mask = read_bitset(&mut r)?;
+        let empty_block_mask = read_bitset(&mut r)?;
+
+        for (sec_idx, sec) in sections.iter_mut().enumerate() {
+            if bitset_get(&empty_sky_mask, sec_idx + 1) {
+                sec.set_uniform_sky(0);
+            }
+            if bitset_get(&empty_block_mask, sec_idx + 1) {
+                sec.set_uniform_block(0);
+            }
+        }
+
+        let sky_len = r.read_usize_bounded(64)?;
+        let mut sky_bits = (0..(sky_mask.len() * 64)).filter(|&b| bitset_get(&sky_mask, b));
+        for _ in 0..sky_len {
+            let arr = r.read_byte_array(2048)?;
+            if let Some(light_sec) = sky_bits.next()
+                && (1..=section_count).contains(&light_sec)
+            {
+                sections[light_sec - 1].set_sky_light_array(&arr);
+            }
+        }
+
+        let block_len = r.read_usize_bounded(64)?;
+        let mut block_bits = (0..(block_mask.len() * 64)).filter(|&b| bitset_get(&block_mask, b));
+        for _ in 0..block_len {
+            let arr = r.read_byte_array(2048)?;
+            if let Some(light_sec) = block_bits.next()
+                && (1..=section_count).contains(&light_sec)
+            {
+                sections[light_sec - 1].set_block_light_array(&arr);
+            }
+        }
+    }
+
     Ok((ChunkPos { x: cx, z: cz }, sections))
+}
+
+/// Decodes raw `LevelChunkWithLight` network packets, unpacks 4-bit Sky & Block lighting,
+/// and builds 2D greedy-merged section meshes concurrently across all CPU cores via `rayon`.
+pub fn decode_and_mesh_chunks_parallel(
+    raw_packets: &[Vec<u8>],
+    section_count: usize,
+) -> ProtocolResult<Vec<DecodedChunkColumn>> {
+    raw_packets
+        .par_iter()
+        .map(|raw| {
+            let (pos, sections) = decode_level_chunk_with_light(raw, section_count)?;
+            let meshes = mesh::mesh_chunk_column(&sections);
+            Ok(DecodedChunkColumn {
+                pos,
+                sections,
+                meshes,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn section_light_compresses_uniform_and_unpacks_nibbles() {
+        let uniform = SectionLight::from_nibble_slice(&[0xFF; 2048]);
+        assert!(matches!(uniform, SectionLight::Uniform(15)));
+        assert_eq!(uniform.get(0), 15);
+        assert_eq!(uniform.get(4095), 15);
+
+        let mut mixed = [0u8; 2048];
+        mixed[0] = 0xE5; // index 0 = 5, index 1 = 14
+        let nibbles = SectionLight::from_nibble_slice(&mixed);
+        assert!(matches!(nibbles, SectionLight::Nibbles(_)));
+        assert_eq!(nibbles.get(0), 5);
+        assert_eq!(nibbles.get(1), 14);
+        assert_eq!(nibbles.get(2), 0);
+    }
 }

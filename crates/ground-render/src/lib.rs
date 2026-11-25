@@ -1,8 +1,13 @@
-//! Native `wgpu` + `winit` 3D voxel renderer for Solara-Ground (Windows & Linux).
+//! Native `wgpu` + `winit` 3D voxel, multiplayer player entity, and 2D HUD renderer
+//! for Solara-Ground (Windows & Linux).
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
+use ground_world::assets::{
+    ATLAS_LAYER_COUNT, BlockTextureAtlas, TILE_SIZE, procedural_block_color,
+};
+use ground_world::generated_blocks;
 use ground_world::mesh::{PackedVoxelVertex, SectionMesh};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -15,6 +20,19 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+/// 9-slot building block palette displayed in the client Hotbar HUD (matching Solara-Sky slots 0..=8).
+pub const HUD_HOTBAR_BLOCKS: [u32; 9] = [
+    generated_blocks::default_state::STONE,
+    generated_blocks::default_state::COBBLESTONE,
+    generated_blocks::default_state::OAK_PLANKS,
+    generated_blocks::default_state::OAK_LOG,
+    generated_blocks::default_state::DIRT,
+    generated_blocks::default_state::GRASS_BLOCK,
+    generated_blocks::default_state::SAND,
+    generated_blocks::default_state::GLASS,
+    generated_blocks::default_state::GLOWSTONE,
+];
+
 /// Returns the `wgpu` vertex buffer layout matching `PackedVoxelVertex` (8 bytes/vertex).
 pub const fn packed_voxel_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Uint32x2];
@@ -23,6 +41,369 @@ pub const fn packed_voxel_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &ATTRS,
     }
+}
+
+/// Compact 16-byte 3D vertex used for articulated remote multiplayer player models.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct EntityVertex {
+    pub pos: [f32; 3],
+    pub color: [u8; 4],
+}
+
+const fn entity_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<EntityVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &ATTRS,
+    }
+}
+
+/// Compact 12-byte 2D NDC vertex used for the Crosshair and 9-Slot Hotbar HUD overlay.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HudVertex {
+    pub pos_ndc: [f32; 2],
+    pub color: [u8; 4],
+}
+
+const fn hud_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Unorm8x4];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<HudVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &ATTRS,
+    }
+}
+
+/// Snapshot of a visible remote player rendered in the 3D world.
+#[derive(Debug, Clone, Copy)]
+pub struct RemotePlayerVisual {
+    pub entity_id: i32,
+    pub feet_pos: Vec3,
+    pub yaw_deg: f32,
+}
+
+fn push_oriented_box(
+    verts: &mut Vec<EntityVertex>,
+    indices: &mut Vec<u32>,
+    origin: Vec3,
+    yaw_rad: f32,
+    local_min: Vec3,
+    local_max: Vec3,
+    base_rgba: [u8; 4],
+) {
+    let (sy, cy) = yaw_rad.sin_cos();
+    let rot = |p: Vec3| -> [f32; 3] {
+        let rx = p.x * cy - p.z * sy;
+        let rz = p.x * sy + p.z * cy;
+        [origin.x + rx, origin.y + p.y, origin.z + rz]
+    };
+
+    let (x0, y0, z0) = (local_min.x, local_min.y, local_min.z);
+    let (x1, y1, z1) = (local_max.x, local_max.y, local_max.z);
+
+    let faces: [([Vec3; 4], f32); 6] = [
+        // +Y top
+        (
+            [
+                Vec3::new(x0, y1, z0),
+                Vec3::new(x0, y1, z1),
+                Vec3::new(x1, y1, z1),
+                Vec3::new(x1, y1, z0),
+            ],
+            1.0,
+        ),
+        // -Y bottom
+        (
+            [
+                Vec3::new(x0, y0, z1),
+                Vec3::new(x0, y0, z0),
+                Vec3::new(x1, y0, z0),
+                Vec3::new(x1, y0, z1),
+            ],
+            0.55,
+        ),
+        // +Z front
+        (
+            [
+                Vec3::new(x0, y0, z1),
+                Vec3::new(x1, y0, z1),
+                Vec3::new(x1, y1, z1),
+                Vec3::new(x0, y1, z1),
+            ],
+            0.86,
+        ),
+        // -Z back
+        (
+            [
+                Vec3::new(x1, y0, z0),
+                Vec3::new(x0, y0, z0),
+                Vec3::new(x0, y1, z0),
+                Vec3::new(x1, y1, z0),
+            ],
+            0.72,
+        ),
+        // +X right
+        (
+            [
+                Vec3::new(x1, y0, z1),
+                Vec3::new(x1, y0, z0),
+                Vec3::new(x1, y1, z0),
+                Vec3::new(x1, y1, z1),
+            ],
+            0.78,
+        ),
+        // -X left
+        (
+            [
+                Vec3::new(x0, y0, z0),
+                Vec3::new(x0, y0, z1),
+                Vec3::new(x0, y1, z1),
+                Vec3::new(x0, y1, z0),
+            ],
+            0.78,
+        ),
+    ];
+
+    for (quad, shade) in faces {
+        let color = [
+            ((f32::from(base_rgba[0]) * shade) as u8),
+            ((f32::from(base_rgba[1]) * shade) as u8),
+            ((f32::from(base_rgba[2]) * shade) as u8),
+            base_rgba[3],
+        ];
+        let base = verts.len() as u32;
+        for corner in quad {
+            verts.push(EntityVertex {
+                pos: rot(corner),
+                color,
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+/// Builds a batched 3D Minecraft-proportioned player mesh (head, torso, arms, legs) for all remote players.
+pub fn build_remote_players_mesh(players: &[RemotePlayerVisual]) -> (Vec<EntityVertex>, Vec<u32>) {
+    let mut verts = Vec::with_capacity(players.len() * 144);
+    let mut indices = Vec::with_capacity(players.len() * 216);
+
+    for p in players {
+        let yaw_rad = p.yaw_deg.to_radians();
+        let hue = (p.entity_id.unsigned_abs().wrapping_mul(2654435761)) & 0xFF;
+        let tunic = [
+            48 + ((hue & 0x3F) as u8),
+            156 + (((hue >> 2) & 0x3F) as u8),
+            188,
+            255,
+        ];
+        let skin = [226, 178, 146, 255];
+        let trousers = [58, 66, 128, 255];
+
+        // Legs (0.0 .. 0.75)
+        push_oriented_box(
+            &mut verts,
+            &mut indices,
+            p.feet_pos,
+            yaw_rad,
+            Vec3::new(-0.25, 0.0, -0.125),
+            Vec3::new(0.0, 0.75, 0.125),
+            trousers,
+        );
+        push_oriented_box(
+            &mut verts,
+            &mut indices,
+            p.feet_pos,
+            yaw_rad,
+            Vec3::new(0.0, 0.0, -0.125),
+            Vec3::new(0.25, 0.75, 0.125),
+            trousers,
+        );
+        // Torso (0.75 .. 1.50)
+        push_oriented_box(
+            &mut verts,
+            &mut indices,
+            p.feet_pos,
+            yaw_rad,
+            Vec3::new(-0.25, 0.75, -0.125),
+            Vec3::new(0.25, 1.50, 0.125),
+            tunic,
+        );
+        // Arms (0.75 .. 1.50)
+        push_oriented_box(
+            &mut verts,
+            &mut indices,
+            p.feet_pos,
+            yaw_rad,
+            Vec3::new(-0.50, 0.75, -0.125),
+            Vec3::new(-0.25, 1.50, 0.125),
+            tunic,
+        );
+        push_oriented_box(
+            &mut verts,
+            &mut indices,
+            p.feet_pos,
+            yaw_rad,
+            Vec3::new(0.25, 0.75, -0.125),
+            Vec3::new(0.50, 1.50, 0.125),
+            tunic,
+        );
+        // Head (1.50 .. 2.00 — scaled to 1.80 total height: 1.35 .. 1.85)
+        push_oriented_box(
+            &mut verts,
+            &mut indices,
+            p.feet_pos,
+            yaw_rad,
+            Vec3::new(-0.25, 1.35, -0.25),
+            Vec3::new(0.25, 1.85, 0.25),
+            skin,
+        );
+    }
+
+    (verts, indices)
+}
+
+fn push_hud_rect_px(
+    out: &mut Vec<HudVertex>,
+    screen_w: f32,
+    screen_h: f32,
+    rect_px: [f32; 4], // [x, y_from_top, w, h]
+    color: [u8; 4],
+) {
+    let [x, y, w, h] = rect_px;
+    let x0 = (x / screen_w) * 2.0 - 1.0;
+    let x1 = ((x + w) / screen_w) * 2.0 - 1.0;
+    let y0 = 1.0 - (y / screen_h) * 2.0;
+    let y1 = 1.0 - ((y + h) / screen_h) * 2.0;
+
+    let v0 = HudVertex {
+        pos_ndc: [x0, y1],
+        color,
+    };
+    let v1 = HudVertex {
+        pos_ndc: [x1, y1],
+        color,
+    };
+    let v2 = HudVertex {
+        pos_ndc: [x1, y0],
+        color,
+    };
+    let v3 = HudVertex {
+        pos_ndc: [x0, y0],
+        color,
+    };
+    out.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
+}
+
+/// Builds pixel-crisp 2D HUD triangles for the center Crosshair and 9-Slot Hotbar.
+pub fn build_hud_vertices(width: u32, height: u32, selected_slot: usize) -> Vec<HudVertex> {
+    let sw = width.max(1) as f32;
+    let sh = height.max(1) as f32;
+    let mut out = Vec::with_capacity(256);
+
+    // 1. Center Crosshair (+ with subtle dark contrast shadow)
+    let cx = (sw * 0.5).floor();
+    let cy = (sh * 0.5).floor();
+    push_hud_rect_px(
+        &mut out,
+        sw,
+        sh,
+        [cx - 9.0, cy - 2.0, 18.0, 4.0],
+        [20, 20, 24, 180],
+    );
+    push_hud_rect_px(
+        &mut out,
+        sw,
+        sh,
+        [cx - 2.0, cy - 9.0, 4.0, 18.0],
+        [20, 20, 24, 180],
+    );
+    push_hud_rect_px(
+        &mut out,
+        sw,
+        sh,
+        [cx - 8.0, cy - 1.0, 16.0, 2.0],
+        [245, 248, 255, 235],
+    );
+    push_hud_rect_px(
+        &mut out,
+        sw,
+        sh,
+        [cx - 1.0, cy - 8.0, 2.0, 16.0],
+        [245, 248, 255, 235],
+    );
+
+    // 2. Centered Bottom 9-Slot Hotbar
+    let slot_px = 44.0f32;
+    let gap_px = 4.0f32;
+    let total_w = 9.0 * slot_px + 8.0 * gap_px + 12.0;
+    let bar_x = ((sw - total_w) * 0.5).floor();
+    let bar_y = (sh - slot_px - 22.0).max(8.0);
+
+    // Outer translucent slate bar backdrop
+    push_hud_rect_px(
+        &mut out,
+        sw,
+        sh,
+        [bar_x, bar_y - 6.0, total_w, slot_px + 12.0],
+        [18, 20, 26, 196],
+    );
+
+    let sel = selected_slot.min(8);
+    for (i, &state_id) in HUD_HOTBAR_BLOCKS.iter().enumerate() {
+        let sx = bar_x + 6.0 + (i as f32) * (slot_px + gap_px);
+        let sy = bar_y;
+
+        if i == sel {
+            // Crisp white active-slot highlight border
+            push_hud_rect_px(
+                &mut out,
+                sw,
+                sh,
+                [sx - 3.0, sy - 3.0, slot_px + 6.0, slot_px + 6.0],
+                [248, 250, 255, 250],
+            );
+        }
+
+        // Inner dark slot well
+        push_hud_rect_px(
+            &mut out,
+            sw,
+            sh,
+            [sx, sy, slot_px, slot_px],
+            [36, 40, 48, 230],
+        );
+
+        // Two-tone 3D block icon preview (top cap + shaded front face)
+        let top_c = procedural_block_color(state_id, true);
+        let side_c = procedural_block_color(state_id, false);
+        let shaded_side = [
+            ((u16::from(side_c[0]) * 4) / 5) as u8,
+            ((u16::from(side_c[1]) * 4) / 5) as u8,
+            ((u16::from(side_c[2]) * 4) / 5) as u8,
+            255,
+        ];
+        push_hud_rect_px(
+            &mut out,
+            sw,
+            sh,
+            [sx + 8.0, sy + 8.0, slot_px - 16.0, 10.0],
+            [top_c[0], top_c[1], top_c[2], 255],
+        );
+        push_hud_rect_px(
+            &mut out,
+            sw,
+            sh,
+            [sx + 8.0, sy + 18.0, slot_px - 16.0, slot_px - 26.0],
+            shaded_side,
+        );
+    }
+
+    out
 }
 
 /// First-person 3D voxel camera producing `[0, 1]` depth view-projection matrices for `wgpu`.
@@ -158,22 +539,37 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-/// Complete `wgpu` voxel rendering pipeline with depth testing and frustum-culled section draws.
+/// Complete `wgpu` voxel rendering pipeline with 2D block texture array, greedy-meshed section draws,
+/// 3D remote player entity rendering, and 2D Crosshair + Hotbar HUD overlay.
 pub struct VoxelRenderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
-    pipeline: wgpu::RenderPipeline,
+    voxel_pipeline: wgpu::RenderPipeline,
+    entity_pipeline: wgpu::RenderPipeline,
+    hud_pipeline: wgpu::RenderPipeline,
     camera_buf: wgpu::Buffer,
-    camera_bg: wgpu::BindGroup,
+    voxel_global_bg: wgpu::BindGroup,
+    entity_camera_bg: wgpu::BindGroup,
     section_bgl: wgpu::BindGroupLayout,
     sections: Vec<GpuSectionDraw>,
+    entity_vbo: Option<wgpu::Buffer>,
+    entity_ibo: Option<wgpu::Buffer>,
+    entity_index_count: u32,
+    hud_vbo: Option<wgpu::Buffer>,
+    hud_vertex_count: u32,
+    selected_slot: usize,
 }
 
 impl VoxelRenderer {
-    pub async fn new(window: Arc<Window>, initial_sections: &[WorldSectionMesh]) -> Result<Self> {
+    pub async fn new(
+        window: Arc<Window>,
+        atlas: &BlockTextureAtlas,
+        initial_sections: &[WorldSectionMesh],
+        initial_players: &[RemotePlayerVisual],
+    ) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: preferred_backends(),
@@ -227,8 +623,76 @@ impl VoxelRenderer {
         surface.configure(&device, &config);
         let depth_view = create_depth_view(&device, config.width, config.height);
 
-        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera-bgl"),
+        // Upload 16x16x16 RGBA8 2D texture array
+        let atlas_tex = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("block-atlas-2d-array"),
+                size: wgpu::Extent3d {
+                    width: TILE_SIZE,
+                    height: TILE_SIZE,
+                    depth_or_array_layers: ATLAS_LAYER_COUNT,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &atlas.pixels,
+        );
+        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("block-atlas-view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("block-atlas-nearest-repeat"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let voxel_global_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("voxel-global-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let entity_camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("entity-camera-bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX,
@@ -262,37 +726,64 @@ impl VoxelRenderer {
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera-bg"),
-            layout: &camera_bgl,
+
+        let voxel_global_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel-global-bg"),
+            layout: &voxel_global_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                },
+            ],
+        });
+
+        let entity_camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("entity-camera-bg"),
+            layout: &entity_camera_bgl,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: camera_buf.as_entire_binding(),
             }],
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let voxel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("voxel-wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("voxel.wgsl").into()),
         });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("voxel-pipeline-layout"),
-            bind_group_layouts: &[&camera_bgl, &section_bgl],
-            push_constant_ranges: &[],
+        let entity_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("entity-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("entity.wgsl").into()),
+        });
+        let hud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hud-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("hud.wgsl").into()),
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let voxel_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("voxel-pipeline-layout"),
+            bind_group_layouts: &[&voxel_global_bgl, &section_bgl],
+            push_constant_ranges: &[],
+        });
+        let voxel_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("voxel-pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&voxel_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &voxel_shader,
                 entry_point: Some("vs_main"),
                 buffers: &[packed_voxel_vertex_layout()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &voxel_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
@@ -319,20 +810,159 @@ impl VoxelRenderer {
             cache: None,
         });
 
+        let entity_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("entity-pipeline-layout"),
+            bind_group_layouts: &[&entity_camera_bgl],
+            push_constant_ranges: &[],
+        });
+        let entity_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("entity-pipeline"),
+            layout: Some(&entity_layout),
+            vertex: wgpu::VertexState {
+                module: &entity_shader,
+                entry_point: Some("vs_entity"),
+                buffers: &[entity_vertex_layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &entity_shader,
+                entry_point: Some("fs_entity"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let hud_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hud-pipeline-layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hud-pipeline"),
+            layout: Some(&hud_layout),
+            vertex: wgpu::VertexState {
+                module: &hud_shader,
+                entry_point: Some("vs_hud"),
+                buffers: &[hud_vertex_layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hud_shader,
+                entry_point: Some("fs_hud"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let mut renderer = Self {
             surface,
             device,
             queue,
             config,
             depth_view,
-            pipeline,
+            voxel_pipeline,
+            entity_pipeline,
+            hud_pipeline,
             camera_buf,
-            camera_bg,
+            voxel_global_bg,
+            entity_camera_bg,
             section_bgl,
             sections: Vec::new(),
+            entity_vbo: None,
+            entity_ibo: None,
+            entity_index_count: 0,
+            hud_vbo: None,
+            hud_vertex_count: 0,
+            selected_slot: 0,
         };
         renderer.upload_sections(initial_sections);
+        renderer.upload_remote_players(initial_players);
+        renderer.rebuild_hud();
         Ok(renderer)
+    }
+
+    pub fn set_selected_slot(&mut self, slot: usize) {
+        let clamped = slot.min(8);
+        if self.selected_slot != clamped {
+            self.selected_slot = clamped;
+            self.rebuild_hud();
+        }
+    }
+
+    fn rebuild_hud(&mut self) {
+        let verts = build_hud_vertices(self.config.width, self.config.height, self.selected_slot);
+        self.hud_vertex_count = verts.len() as u32;
+        if verts.is_empty() {
+            self.hud_vbo = None;
+            return;
+        }
+        self.hud_vbo = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("hud-vbo"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+        );
+    }
+
+    pub fn upload_remote_players(&mut self, players: &[RemotePlayerVisual]) {
+        let (verts, indices) = build_remote_players_mesh(players);
+        self.entity_index_count = indices.len() as u32;
+        if indices.is_empty() {
+            self.entity_vbo = None;
+            self.entity_ibo = None;
+            return;
+        }
+        self.entity_vbo = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("remote-players-vbo"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+        );
+        self.entity_ibo = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("remote-players-ibo"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+        );
     }
 
     pub fn upload_sections(&mut self, world_sections: &[WorldSectionMesh]) {
@@ -389,6 +1019,7 @@ impl VoxelRenderer {
             self.surface.configure(&self.device, &self.config);
             self.depth_view =
                 create_depth_view(&self.device, self.config.width, self.config.height);
+            self.rebuild_hud();
         }
     }
 
@@ -414,14 +1045,14 @@ impl VoxelRenderer {
                 label: Some("voxel-frame-encoder"),
             });
 
+        // Pass 1: 3D Greedy-Meshed World + 3D Remote Multiplayer Entities (with Depth Buffer)
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("voxel-pass"),
+                label: Some("voxel-3d-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Overworld sky blue (#78A7FF)
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.20,
                             g: 0.42,
@@ -443,8 +1074,8 @@ impl VoxelRenderer {
                 occlusion_query_set: None,
             });
 
-            rpass.set_pipeline(&self.pipeline);
-            rpass.set_bind_group(0, &self.camera_bg, &[]);
+            rpass.set_pipeline(&self.voxel_pipeline);
+            rpass.set_bind_group(0, &self.voxel_global_bg, &[]);
 
             for sec in &self.sections {
                 let min = sec.origin;
@@ -457,6 +1088,39 @@ impl VoxelRenderer {
                 rpass.set_index_buffer(sec.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 rpass.draw_indexed(0..sec.index_count, 0, 0..1);
             }
+
+            if self.entity_index_count > 0
+                && let (Some(vbo), Some(ibo)) = (&self.entity_vbo, &self.entity_ibo)
+            {
+                rpass.set_pipeline(&self.entity_pipeline);
+                rpass.set_bind_group(0, &self.entity_camera_bg, &[]);
+                rpass.set_vertex_buffer(0, vbo.slice(..));
+                rpass.set_index_buffer(ibo.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..self.entity_index_count, 0, 0..1);
+            }
+        }
+
+        // Pass 2: Crisp 2D Crosshair & 9-Slot Hotbar HUD Overlay
+        if self.hud_vertex_count > 0
+            && let Some(hud_vbo) = &self.hud_vbo
+        {
+            let mut hpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hud-2d-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            hpass.set_pipeline(&self.hud_pipeline);
+            hpass.set_vertex_buffer(0, hud_vbo.slice(..));
+            hpass.draw(0..self.hud_vertex_count, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -467,7 +1131,9 @@ impl VoxelRenderer {
 
 struct VoxelApp {
     window_title: String,
+    atlas: BlockTextureAtlas,
     initial_sections: Vec<WorldSectionMesh>,
+    initial_players: Vec<RemotePlayerVisual>,
     camera: VoxelCamera,
     window: Option<Arc<Window>>,
     renderer: Option<VoxelRenderer>,
@@ -490,7 +1156,9 @@ impl ApplicationHandler for VoxelApp {
                 self.camera.aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
                 match pollster::block_on(VoxelRenderer::new(
                     Arc::clone(&win),
+                    &self.atlas,
                     &self.initial_sections,
+                    &self.initial_players,
                 )) {
                     Ok(renderer) => {
                         self.window = Some(win);
@@ -533,6 +1201,23 @@ impl ApplicationHandler for VoxelApp {
                 if code == KeyCode::Escape && state == ElementState::Pressed {
                     event_loop.exit();
                     return;
+                }
+                if state == ElementState::Pressed {
+                    let hotbar_key = match code {
+                        KeyCode::Digit1 => Some(0),
+                        KeyCode::Digit2 => Some(1),
+                        KeyCode::Digit3 => Some(2),
+                        KeyCode::Digit4 => Some(3),
+                        KeyCode::Digit5 => Some(4),
+                        KeyCode::Digit6 => Some(5),
+                        KeyCode::Digit7 => Some(6),
+                        KeyCode::Digit8 => Some(7),
+                        KeyCode::Digit9 => Some(8),
+                        _ => None,
+                    };
+                    if let (Some(slot), Some(r)) = (hotbar_key, &mut self.renderer) {
+                        r.set_selected_slot(slot);
+                    }
                 }
                 match state {
                     ElementState::Pressed => {
@@ -610,17 +1295,21 @@ impl ApplicationHandler for VoxelApp {
     }
 }
 
-/// Opens the native `winit` + `wgpu` 3D voxel window and renders `sections` interactively.
+/// Opens the native `winit` + `wgpu` 3D voxel window with texture array, remote players, and HUD.
 pub fn run_voxel_window(
     title: impl Into<String>,
+    atlas: BlockTextureAtlas,
     camera: VoxelCamera,
     sections: Vec<WorldSectionMesh>,
+    remote_players: Vec<RemotePlayerVisual>,
 ) -> Result<()> {
     let event_loop = EventLoop::new().context("create winit event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = VoxelApp {
         window_title: title.into(),
+        atlas,
         initial_sections: sections,
+        initial_players: remote_players,
         camera,
         window: None,
         renderer: None,
@@ -651,5 +1340,21 @@ mod tests {
     #[test]
     fn vertex_layout_stride_is_eight_bytes() {
         assert_eq!(packed_voxel_vertex_layout().array_stride, 8);
+    }
+
+    #[test]
+    fn remote_player_and_hud_meshes_generate_expected_primitives() {
+        let (p_verts, p_idx) = build_remote_players_mesh(&[RemotePlayerVisual {
+            entity_id: 7,
+            feet_pos: Vec3::new(8.0, -58.0, 8.0),
+            yaw_deg: 45.0,
+        }]);
+        // 6 articulated limbs * 6 faces * 4 verts = 144 verts, 216 indices
+        assert_eq!(p_verts.len(), 144);
+        assert_eq!(p_idx.len(), 216);
+
+        let hud = build_hud_vertices(1280, 720, 3);
+        assert!(hud.len() >= 180);
+        assert_eq!(hud.len() % 6, 0);
     }
 }

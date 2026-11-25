@@ -26,6 +26,7 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 glam = "0.29"
 num-bigint = "0.4"
+png = "0.17"
 pollster = "0.4"
 rand = "0.8"
 rayon = "1.10"
