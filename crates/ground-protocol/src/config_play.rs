@@ -413,6 +413,20 @@ pub fn encode_start_destroy_block(
     w.into_inner()
 }
 
+/// Encodes `ServerboundPlayerActionPacket` (`STOP_DESTROY_BLOCK = 2`, finishes Survival block break).
+pub fn encode_stop_destroy_block(
+    block_pos: (i32, i32, i32),
+    face_direction: u8,
+    sequence: i32,
+) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(16);
+    w.write_varint(2); // STOP_DESTROY_BLOCK
+    w.write_block_pos(block_pos.0, block_pos.1, block_pos.2);
+    w.write_u8(face_direction);
+    w.write_varint(sequence);
+    w.into_inner()
+}
+
 /// Encodes `ServerboundUseItemOnPacket` (main hand block placement against `block_pos` / `face_direction`).
 pub fn encode_use_item_on(
     block_pos: (i32, i32, i32),
@@ -439,12 +453,40 @@ pub fn encode_chat_command(command: &str) -> Vec<u8> {
     w.into_inner()
 }
 
+/// Encodes `ServerboundAttackPacket` (`c2s::ATTACK = 0x01`, `entityId: VarInt`).
+pub fn encode_attack_entity(entity_id: i32) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(5);
+    w.write_varint(entity_id);
+    w.into_inner()
+}
+
+/// Encodes `ServerboundClientCommandPacket` (`PERFORM_RESPAWN = 0`).
+pub fn encode_perform_respawn() -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(2);
+    w.write_varint(0);
+    w.into_inner()
+}
+
+/// Encodes `ServerboundCommandSuggestionPacket` (`id: VarInt, command: String`).
+pub fn encode_request_command_suggestions(tx_id: i32, input: &str) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(8 + input.len());
+    w.write_varint(tx_id);
+    w.write_string(input);
+    w.into_inner()
+}
+
 /// Decoded live Play-state server event processed during gameplay.
 #[derive(Debug, Clone)]
 pub enum PlayServerEvent {
     LevelChunkWithLight(Vec<u8>),
-    BlockUpdate { pos: (i32, i32, i32), state_id: u32 },
-    SystemChat { text: String, overlay: bool },
+    BlockUpdate {
+        pos: (i32, i32, i32),
+        state_id: u32,
+    },
+    SystemChat {
+        text: String,
+        overlay: bool,
+    },
     Teleport(PlayerSpawnTransform),
     BlockChangedAck(i32),
     PlayerInfoUpdate(Vec<RemotePlayerInfo>),
@@ -452,6 +494,22 @@ pub enum PlayServerEvent {
     AddEntity(RemoteEntitySpawn),
     TeleportEntity(RemoteEntityTeleport),
     RemoveEntities(Vec<i32>),
+    SetHealth {
+        health: f32,
+        food: i32,
+        saturation: f32,
+    },
+    HurtAnimation {
+        entity_id: i32,
+        yaw_deg: f32,
+    },
+    Respawn,
+    CommandSuggestions {
+        tx_id: i32,
+        start: usize,
+        length: usize,
+        matches: Vec<String>,
+    },
     Other(i32),
 }
 
@@ -540,6 +598,47 @@ pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult
                     &mut r,
                 )?));
             }
+            s2c::SET_HEALTH => {
+                let mut r = PacketReader::new(&payload);
+                let health = r.read_f32()?;
+                let food = r.read_varint()?;
+                let saturation = r.read_f32()?;
+                return Ok(PlayServerEvent::SetHealth {
+                    health,
+                    food,
+                    saturation,
+                });
+            }
+            s2c::HURT_ANIMATION => {
+                let mut r = PacketReader::new(&payload);
+                let entity_id = r.read_varint()?;
+                let yaw_deg = r.read_f32()?;
+                return Ok(PlayServerEvent::HurtAnimation { entity_id, yaw_deg });
+            }
+            s2c::RESPAWN => {
+                return Ok(PlayServerEvent::Respawn);
+            }
+            s2c::COMMAND_SUGGESTIONS => {
+                let mut r = PacketReader::new(&payload);
+                let tx_id = r.read_varint()?;
+                let start = r.read_usize_bounded(32500)?;
+                let length = r.read_usize_bounded(32500)?;
+                let count = r.read_usize_bounded(1024)?;
+                let mut matches = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let text = r.read_string(32500)?;
+                    if r.read_bool()? {
+                        let _tooltip = read_network_nbt(&mut r)?;
+                    }
+                    matches.push(text);
+                }
+                return Ok(PlayServerEvent::CommandSuggestions {
+                    tx_id,
+                    start,
+                    length,
+                    matches,
+                });
+            }
             other => return Ok(PlayServerEvent::Other(other)),
         }
     }
@@ -554,6 +653,7 @@ pub struct InitialPlayBootstrap {
     pub raw_chunk_packets: Vec<Vec<u8>>,
     pub initial_players: Vec<RemotePlayerInfo>,
     pub initial_entities: Vec<RemoteEntitySpawn>,
+    pub initial_health: (f32, i32),
 }
 
 /// Collects the initial Play state login, streamed spawn chunks, initial players/entities,
@@ -567,6 +667,7 @@ pub async fn bootstrap_play_session(
     let mut raw_chunk_packets = Vec::new();
     let mut initial_players = Vec::new();
     let mut initial_entities = Vec::new();
+    let mut initial_health = (20.0f32, 20i32);
 
     loop {
         let (pkt_id, payload) = conn.read_packet().await?;
@@ -597,6 +698,12 @@ pub async fn bootstrap_play_session(
                 let mut r = PacketReader::new(&payload);
                 initial_entities.push(decode_add_entity(&mut r)?);
             }
+            s2c::SET_HEALTH => {
+                let mut r = PacketReader::new(&payload);
+                let hp = r.read_f32()?;
+                let food = r.read_varint()?;
+                initial_health = (hp, food);
+            }
             s2c::CHUNK_BATCH_FINISHED => {
                 let mut w = PacketWriter::with_capacity(4);
                 w.write_f32(25.0);
@@ -618,6 +725,7 @@ pub async fn bootstrap_play_session(
                     raw_chunk_packets,
                     initial_players,
                     initial_entities,
+                    initial_health,
                 });
             }
             _ => {}

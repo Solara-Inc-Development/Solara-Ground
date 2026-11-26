@@ -889,20 +889,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ground-audio"
+version = "0.1.0-alpha.1"
+
+[[package]]
 name = "ground-client"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
  "glam",
+ "ground-audio",
+ "ground-data",
  "ground-protocol",
  "ground-render",
+ "ground-ui",
  "ground-world",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "ground-data"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "ground-protocol"
@@ -932,11 +943,20 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "glam",
+ "ground-data",
+ "ground-ui",
  "ground-world",
  "pollster",
  "tracing",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "ground-ui"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "bytemuck",
 ]
 
 [[package]]

@@ -1,8 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ground-data",
     "crates/ground-protocol",
     "crates/ground-world",
+    "crates/ground-ui",
+    "crates/ground-audio",
     "crates/ground-render",
     "crates/ground-client",
     "tools/mc-codegen",
@@ -43,8 +46,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 wgpu = "24"
 winit = "0.30"
 
+ground-data = { path = "crates/ground-data" }
 ground-protocol = { path = "crates/ground-protocol" }
 ground-world = { path = "crates/ground-world" }
+ground-ui = { path = "crates/ground-ui" }
+ground-audio = { path = "crates/ground-audio" }
 ground-render = { path = "crates/ground-render" }
 
 [profile.release]

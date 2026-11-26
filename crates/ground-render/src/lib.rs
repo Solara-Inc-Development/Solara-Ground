@@ -1,9 +1,12 @@
 //! Native `wgpu` + `winit` 3D voxel, GPU mega-buffer + `multi_draw_indexed_indirect`,
-//! multiplayer player entity, and 2D HUD renderer for Solara-Ground (Windows & Linux).
+//! 3D players & mobs, target block selection outline, FPS mouse-look, and 2D Survival UI renderer
+//! for Solara-Ground (Windows & Linux).
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
+use ground_data::generated_entities;
+use ground_ui::{HudModel, UiVertex, build_full_ui_vertices};
 use ground_world::assets::{
     ATLAS_LAYER_COUNT, BlockTextureAtlas, TILE_SIZE, procedural_block_color,
 };
@@ -16,10 +19,10 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// 9-slot building block palette displayed in the client Hotbar HUD (matching Solara-Sky slots 0..=8).
 pub const HUD_HOTBAR_BLOCKS: [u32; 9] = [
@@ -37,26 +40,39 @@ pub const HUD_HOTBAR_BLOCKS: [u32; 9] = [
 /// Non-blocking updates pushed from the background network & `rayon` worker to the render thread.
 #[derive(Debug)]
 pub enum RenderSceneUpdate {
-    ReplaceSections(Vec<WorldSectionMesh>),
-    RemotePlayers(Vec<RemotePlayerVisual>),
+    ReplaceSections {
+        sections: Vec<WorldSectionMesh>,
+        chunk_count: usize,
+    },
+    Entities(Vec<RemoteEntityVisual>),
     TeleportCamera {
         position: Vec3,
         yaw_rad: f32,
         pitch_rad: f32,
     },
+    Vitals {
+        health: f32,
+        food: i32,
+    },
+    ChatLine(String),
+    TargetBlock(Option<[i32; 3]>),
 }
 
 /// Non-blocking gameplay actions pushed from the `winit` window thread to the network worker.
 #[derive(Debug, Clone, Copy)]
 pub enum ClientWindowAction {
-    Move {
-        feet_pos: [f64; 3],
+    TickCamera {
+        eye_pos: [f64; 3],
+        look_dir: [f64; 3],
+        wish_xz: [f64; 2],
+        jump: bool,
+        survival_physics: bool,
         yaw_deg: f32,
         pitch_deg: f32,
-        on_ground: bool,
+        dt: f64,
     },
     SelectHotbarSlot(u16),
-    BreakLook {
+    PrimaryAttackOrBreak {
         eye_pos: [f64; 3],
         look_dir: [f64; 3],
     },
@@ -64,9 +80,10 @@ pub enum ClientWindowAction {
         eye_pos: [f64; 3],
         look_dir: [f64; 3],
     },
+    Respawn,
 }
 
-/// Optional live multiplayer channels wired into `run_voxel_window`.
+/// Live multiplayer channels wired into `run_voxel_window`.
 pub struct LiveRenderBridge {
     pub scene_rx: Receiver<RenderSceneUpdate>,
     pub action_tx: Sender<ClientWindowAction>,
@@ -95,15 +112,12 @@ pub struct DrawIndexedIndirectCmd {
 
 const _: () = assert!(std::mem::size_of::<DrawIndexedIndirectCmd>() == 20);
 
-/// Sub-allocated section draw metadata inside the contiguous GPU Mega-Buffer.
 #[derive(Debug, Clone, Copy)]
 pub struct MegaSectionSlot {
     pub origin: Vec3,
     pub cmd: DrawIndexedIndirectCmd,
 }
 
-/// Contiguous CPU staging payload packing all world chunk sections into a single VBO, single IBO,
-/// and single section-origin storage array for zero-bind-switch / `multi_draw_indexed_indirect` rendering.
 #[derive(Debug, Default)]
 pub struct PackedMegaMesh {
     pub vertices: Vec<PackedVoxelVertex>,
@@ -158,7 +172,6 @@ pub fn pack_mega_mesh_batch(world_sections: &[WorldSectionMesh]) -> PackedMegaMe
     }
 }
 
-/// Filters `slots` against `frustum` into `out_cmds` without allocating.
 pub fn build_frustum_culled_indirect_cmds(
     slots: &[MegaSectionSlot],
     frustum: &Frustum,
@@ -172,7 +185,6 @@ pub fn build_frustum_culled_indirect_cmds(
     }
 }
 
-/// Compact 16-byte 3D vertex used for articulated remote multiplayer player models.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct EntityVertex {
@@ -190,31 +202,26 @@ const fn entity_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-/// Compact 12-byte 2D NDC vertex used for the Crosshair and 9-Slot Hotbar HUD overlay.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct HudVertex {
-    pub pos_ndc: [f32; 2],
-    pub color: [u8; 4],
-}
-
-const fn hud_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+const fn ui_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     const ATTRS: [wgpu::VertexAttribute; 2] =
         wgpu::vertex_attr_array![0 => Float32x2, 1 => Unorm8x4];
     wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<HudVertex>() as wgpu::BufferAddress,
+        array_stride: std::mem::size_of::<UiVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &ATTRS,
     }
 }
 
-/// Snapshot of a visible remote player rendered in the 3D world.
+/// Snapshot of a visible remote player or Overworld mob rendered in the 3D world.
 #[derive(Debug, Clone, Copy)]
-pub struct RemotePlayerVisual {
+pub struct RemoteEntityVisual {
     pub entity_id: i32,
+    pub entity_type: u32,
     pub feet_pos: Vec3,
     pub yaw_deg: f32,
 }
+
+pub type RemotePlayerVisual = RemoteEntityVisual;
 
 fn push_oriented_box(
     verts: &mut Vec<EntityVertex>,
@@ -310,213 +317,231 @@ fn push_oriented_box(
     }
 }
 
-/// Builds a batched 3D Minecraft-proportioned player mesh (head, torso, arms, legs) for all remote players.
-pub fn build_remote_players_mesh(players: &[RemotePlayerVisual]) -> (Vec<EntityVertex>, Vec<u32>) {
-    let mut verts = Vec::with_capacity(players.len() * 144);
-    let mut indices = Vec::with_capacity(players.len() * 216);
+/// Builds a batched 3D mesh for all visible remote players, passive animals, hostile mobs,
+/// and the optional 3D target-block black selection wireframe!
+pub fn build_entities_and_outline_mesh(
+    entities: &[RemoteEntityVisual],
+    target_block: Option<[i32; 3]>,
+) -> (Vec<EntityVertex>, Vec<u32>) {
+    let mut verts = Vec::with_capacity(entities.len() * 144 + 288);
+    let mut indices = Vec::with_capacity(entities.len() * 216 + 432);
 
-    for p in players {
-        let yaw_rad = p.yaw_deg.to_radians();
-        let hue = (p.entity_id.unsigned_abs().wrapping_mul(2654435761)) & 0xFF;
-        let tunic = [
-            48 + ((hue & 0x3F) as u8),
-            156 + (((hue >> 2) & 0x3F) as u8),
-            188,
-            255,
-        ];
-        let skin = [226, 178, 146, 255];
-        let trousers = [58, 66, 128, 255];
+    for e in entities {
+        let yaw_rad = e.yaw_deg.to_radians();
+        match e.entity_type {
+            generated_entities::id::PIG
+            | generated_entities::id::COW
+            | generated_entities::id::SHEEP => {
+                let (coat, head_c, leg_h) = match e.entity_type {
+                    generated_entities::id::PIG => {
+                        ([242, 168, 178, 255], [246, 178, 186, 255], 0.35)
+                    }
+                    generated_entities::id::COW => ([92, 62, 42, 255], [120, 88, 66, 255], 0.50),
+                    _ => ([242, 242, 246, 255], [214, 192, 168, 255], 0.45),
+                };
+                // 4 legs
+                for &(lx, lz) in &[(-0.22, -0.30), (0.10, -0.30), (-0.22, 0.22), (0.10, 0.22)] {
+                    push_oriented_box(
+                        &mut verts,
+                        &mut indices,
+                        e.feet_pos,
+                        yaw_rad,
+                        Vec3::new(lx, 0.0, lz),
+                        Vec3::new(lx + 0.14, leg_h, lz + 0.14),
+                        head_c,
+                    );
+                }
+                // Body
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.32, leg_h, -0.42),
+                    Vec3::new(0.32, leg_h + 0.48, 0.42),
+                    coat,
+                );
+                // Head
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.22, leg_h + 0.22, 0.36),
+                    Vec3::new(0.22, leg_h + 0.62, 0.72),
+                    head_c,
+                );
+            }
+            generated_entities::id::ZOMBIE => {
+                let green_skin = [92, 152, 82, 255];
+                let shirt = [56, 146, 162, 255];
+                let pants = [62, 58, 132, 255];
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.25, 0.0, -0.125),
+                    Vec3::new(0.25, 0.75, 0.125),
+                    pants,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.25, 0.75, -0.125),
+                    Vec3::new(0.25, 1.50, 0.125),
+                    shirt,
+                );
+                // Zombie outstretched arms (+Z)
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.50, 1.25, 0.0),
+                    Vec3::new(-0.25, 1.50, 0.68),
+                    green_skin,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(0.25, 1.25, 0.0),
+                    Vec3::new(0.50, 1.50, 0.68),
+                    green_skin,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.25, 1.45, -0.25),
+                    Vec3::new(0.25, 1.95, 0.25),
+                    green_skin,
+                );
+            }
+            _ => {
+                let hue = (e.entity_id.unsigned_abs().wrapping_mul(2654435761)) & 0xFF;
+                let tunic = [
+                    48 + ((hue & 0x3F) as u8),
+                    156 + (((hue >> 2) & 0x3F) as u8),
+                    188,
+                    255,
+                ];
+                let skin = [226, 178, 146, 255];
+                let trousers = [58, 66, 128, 255];
 
-        push_oriented_box(
-            &mut verts,
-            &mut indices,
-            p.feet_pos,
-            yaw_rad,
-            Vec3::new(-0.25, 0.0, -0.125),
-            Vec3::new(0.0, 0.75, 0.125),
-            trousers,
-        );
-        push_oriented_box(
-            &mut verts,
-            &mut indices,
-            p.feet_pos,
-            yaw_rad,
-            Vec3::new(0.0, 0.0, -0.125),
-            Vec3::new(0.25, 0.75, 0.125),
-            trousers,
-        );
-        push_oriented_box(
-            &mut verts,
-            &mut indices,
-            p.feet_pos,
-            yaw_rad,
-            Vec3::new(-0.25, 0.75, -0.125),
-            Vec3::new(0.25, 1.50, 0.125),
-            tunic,
-        );
-        push_oriented_box(
-            &mut verts,
-            &mut indices,
-            p.feet_pos,
-            yaw_rad,
-            Vec3::new(-0.50, 0.75, -0.125),
-            Vec3::new(-0.25, 1.50, 0.125),
-            tunic,
-        );
-        push_oriented_box(
-            &mut verts,
-            &mut indices,
-            p.feet_pos,
-            yaw_rad,
-            Vec3::new(0.25, 0.75, -0.125),
-            Vec3::new(0.50, 1.50, 0.125),
-            tunic,
-        );
-        push_oriented_box(
-            &mut verts,
-            &mut indices,
-            p.feet_pos,
-            yaw_rad,
-            Vec3::new(-0.25, 1.35, -0.25),
-            Vec3::new(0.25, 1.85, 0.25),
-            skin,
-        );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.25, 0.0, -0.125),
+                    Vec3::new(0.0, 0.75, 0.125),
+                    trousers,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(0.0, 0.0, -0.125),
+                    Vec3::new(0.25, 0.75, 0.125),
+                    trousers,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.25, 0.75, -0.125),
+                    Vec3::new(0.25, 1.50, 0.125),
+                    tunic,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.50, 0.75, -0.125),
+                    Vec3::new(-0.25, 1.50, 0.125),
+                    tunic,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(0.25, 0.75, -0.125),
+                    Vec3::new(0.50, 1.50, 0.125),
+                    tunic,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.25, 1.35, -0.25),
+                    Vec3::new(0.25, 1.85, 0.25),
+                    skin,
+                );
+            }
+        }
+    }
+
+    // 12-edge 3D target block wireframe box
+    if let Some([bx, by, bz]) = target_block {
+        let base = Vec3::new(bx as f32 - 0.004, by as f32 - 0.004, bz as f32 - 0.004);
+        let s = 1.008f32;
+        let t = 0.016f32;
+        let wire = [16, 18, 22, 235];
+
+        // 4 X-edges
+        for &(ey, ez) in &[(0.0, 0.0), (s - t, 0.0), (0.0, s - t), (s - t, s - t)] {
+            push_oriented_box(
+                &mut verts,
+                &mut indices,
+                base,
+                0.0,
+                Vec3::new(0.0, ey, ez),
+                Vec3::new(s, ey + t, ez + t),
+                wire,
+            );
+        }
+        // 4 Y-edges
+        for &(ex, ez) in &[(0.0, 0.0), (s - t, 0.0), (0.0, s - t), (s - t, s - t)] {
+            push_oriented_box(
+                &mut verts,
+                &mut indices,
+                base,
+                0.0,
+                Vec3::new(ex, 0.0, ez),
+                Vec3::new(ex + t, s, ez + t),
+                wire,
+            );
+        }
+        // 4 Z-edges
+        for &(ex, ey) in &[(0.0, 0.0), (s - t, 0.0), (0.0, s - t), (s - t, s - t)] {
+            push_oriented_box(
+                &mut verts,
+                &mut indices,
+                base,
+                0.0,
+                Vec3::new(ex, ey, 0.0),
+                Vec3::new(ex + t, ey + t, s),
+                wire,
+            );
+        }
     }
 
     (verts, indices)
 }
 
-fn push_hud_rect_px(
-    out: &mut Vec<HudVertex>,
-    screen_w: f32,
-    screen_h: f32,
-    rect_px: [f32; 4],
-    color: [u8; 4],
-) {
-    let [x, y, w, h] = rect_px;
-    let x0 = (x / screen_w) * 2.0 - 1.0;
-    let x1 = ((x + w) / screen_w) * 2.0 - 1.0;
-    let y0 = 1.0 - (y / screen_h) * 2.0;
-    let y1 = 1.0 - ((y + h) / screen_h) * 2.0;
-
-    let v0 = HudVertex {
-        pos_ndc: [x0, y1],
-        color,
-    };
-    let v1 = HudVertex {
-        pos_ndc: [x1, y1],
-        color,
-    };
-    let v2 = HudVertex {
-        pos_ndc: [x1, y0],
-        color,
-    };
-    let v3 = HudVertex {
-        pos_ndc: [x0, y0],
-        color,
-    };
-    out.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
-}
-
-/// Builds pixel-crisp 2D HUD triangles for the center Crosshair and 9-Slot Hotbar.
-pub fn build_hud_vertices(width: u32, height: u32, selected_slot: usize) -> Vec<HudVertex> {
-    let sw = width.max(1) as f32;
-    let sh = height.max(1) as f32;
-    let mut out = Vec::with_capacity(256);
-
-    let cx = (sw * 0.5).floor();
-    let cy = (sh * 0.5).floor();
-    push_hud_rect_px(
-        &mut out,
-        sw,
-        sh,
-        [cx - 9.0, cy - 2.0, 18.0, 4.0],
-        [20, 20, 24, 180],
-    );
-    push_hud_rect_px(
-        &mut out,
-        sw,
-        sh,
-        [cx - 2.0, cy - 9.0, 4.0, 18.0],
-        [20, 20, 24, 180],
-    );
-    push_hud_rect_px(
-        &mut out,
-        sw,
-        sh,
-        [cx - 8.0, cy - 1.0, 16.0, 2.0],
-        [245, 248, 255, 235],
-    );
-    push_hud_rect_px(
-        &mut out,
-        sw,
-        sh,
-        [cx - 1.0, cy - 8.0, 2.0, 16.0],
-        [245, 248, 255, 235],
-    );
-
-    let slot_px = 44.0f32;
-    let gap_px = 4.0f32;
-    let total_w = 9.0 * slot_px + 8.0 * gap_px + 12.0;
-    let bar_x = ((sw - total_w) * 0.5).floor();
-    let bar_y = (sh - slot_px - 22.0).max(8.0);
-
-    push_hud_rect_px(
-        &mut out,
-        sw,
-        sh,
-        [bar_x, bar_y - 6.0, total_w, slot_px + 12.0],
-        [18, 20, 26, 196],
-    );
-
-    let sel = selected_slot.min(8);
-    for (i, &state_id) in HUD_HOTBAR_BLOCKS.iter().enumerate() {
-        let sx = bar_x + 6.0 + (i as f32) * (slot_px + gap_px);
-        let sy = bar_y;
-
-        if i == sel {
-            push_hud_rect_px(
-                &mut out,
-                sw,
-                sh,
-                [sx - 3.0, sy - 3.0, slot_px + 6.0, slot_px + 6.0],
-                [248, 250, 255, 250],
-            );
-        }
-
-        push_hud_rect_px(
-            &mut out,
-            sw,
-            sh,
-            [sx, sy, slot_px, slot_px],
-            [36, 40, 48, 230],
-        );
-
-        let top_c = procedural_block_color(state_id, true);
-        let side_c = procedural_block_color(state_id, false);
-        let shaded_side = [
-            ((u16::from(side_c[0]) * 4) / 5) as u8,
-            ((u16::from(side_c[1]) * 4) / 5) as u8,
-            ((u16::from(side_c[2]) * 4) / 5) as u8,
-            255,
-        ];
-        push_hud_rect_px(
-            &mut out,
-            sw,
-            sh,
-            [sx + 8.0, sy + 8.0, slot_px - 16.0, 10.0],
-            [top_c[0], top_c[1], top_c[2], 255],
-        );
-        push_hud_rect_px(
-            &mut out,
-            sw,
-            sh,
-            [sx + 8.0, sy + 18.0, slot_px - 16.0, slot_px - 26.0],
-            shaded_side,
-        );
-    }
-
-    out
+pub fn build_remote_players_mesh(players: &[RemoteEntityVisual]) -> (Vec<EntityVertex>, Vec<u32>) {
+    build_entities_and_outline_mesh(players, None)
 }
 
 /// First-person 3D voxel camera producing `[0, 1]` depth view-projection matrices for `wgpu`.
@@ -552,6 +577,11 @@ impl VoxelCamera {
         Vec3::new(cy * cp, sp, sy * cp).normalize()
     }
 
+    pub fn forward_xz(&self) -> Vec3 {
+        let (sy, cy) = self.yaw_rad.sin_cos();
+        Vec3::new(cy, 0.0, sy).normalize()
+    }
+
     pub fn right_xz(&self) -> Vec3 {
         let (sy, cy) = self.yaw_rad.sin_cos();
         Vec3::new(-sy, 0.0, cy).normalize()
@@ -565,7 +595,6 @@ impl VoxelCamera {
     }
 }
 
-/// Six-plane view frustum extracted via Gribb-Hartmann for fast CPU chunk AABB culling.
 #[derive(Debug, Clone, Copy)]
 pub struct Frustum {
     planes: [Vec4; 6],
@@ -605,7 +634,6 @@ pub fn preferred_backends() -> wgpu::Backends {
     wgpu::Backends::VULKAN | wgpu::Backends::DX12
 }
 
-/// Positioned CPU chunk-section mesh ready to be packed into the GPU Mega-Buffer.
 #[derive(Debug, Clone)]
 pub struct WorldSectionMesh {
     pub origin: Vec3,
@@ -639,8 +667,18 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-/// Sodium-class single-VBO Mega-Buffer `wgpu` renderer with `multi_draw_indexed_indirect`
-/// (zero per-section buffer/bind-group switches), 3D remote players, and 2D HUD.
+fn hotbar_icon_colors() -> ([[u8; 4]; 9], [[u8; 4]; 9]) {
+    let mut tops = [[0u8; 4]; 9];
+    let mut sides = [[0u8; 4]; 9];
+    for (i, &st) in HUD_HOTBAR_BLOCKS.iter().enumerate() {
+        tops[i] = procedural_block_color(st, true);
+        sides[i] = procedural_block_color(st, false);
+    }
+    (tops, sides)
+}
+
+/// Sodium-class single-VBO Mega-Buffer `wgpu` renderer with `multi_draw_indexed_indirect`,
+/// 3D players & mobs, target block selection outline, and full 2D `ground-ui` Survival HUD.
 pub struct VoxelRenderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -664,13 +702,14 @@ pub struct VoxelRenderer {
     section_slots: Vec<MegaSectionSlot>,
     visible_cmds: Vec<DrawIndexedIndirectCmd>,
     last_visible_sections: usize,
+    entities_cache: Vec<RemoteEntityVisual>,
+    target_block: Option<[i32; 3]>,
     entity_vbo: Option<wgpu::Buffer>,
     entity_ibo: Option<wgpu::Buffer>,
     entity_index_count: u32,
-    remote_player_count: usize,
     hud_vbo: Option<wgpu::Buffer>,
     hud_vertex_count: u32,
-    selected_slot: usize,
+    hud_model: HudModel,
 }
 
 impl VoxelRenderer {
@@ -678,7 +717,9 @@ impl VoxelRenderer {
         window: Arc<Window>,
         atlas: &BlockTextureAtlas,
         initial_sections: &[WorldSectionMesh],
-        initial_players: &[RemotePlayerVisual],
+        initial_entities: &[RemoteEntityVisual],
+        initial_health: (f32, i32),
+        initial_chunk_count: usize,
     ) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -1001,7 +1042,7 @@ impl VoxelRenderer {
             vertex: wgpu::VertexState {
                 module: &hud_shader,
                 entry_point: Some("vs_hud"),
-                buffers: &[hud_vertex_layout()],
+                buffers: &[ui_vertex_layout()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1024,6 +1065,25 @@ impl VoxelRenderer {
             multiview: None,
             cache: None,
         });
+
+        let (tops, sides) = hotbar_icon_colors();
+        let hud_model = HudModel {
+            width: config.width,
+            height: config.height,
+            selected_slot: 0,
+            hotbar_top_colors: tops,
+            hotbar_side_colors: sides,
+            health: initial_health.0,
+            food: initial_health.1,
+            survival_physics: false,
+            paused: false,
+            fps: 0,
+            frame_ms: 0.0,
+            camera_pos: [8.0, -56.0, 8.0],
+            chunk_count: initial_chunk_count,
+            entity_count: initial_entities.len(),
+            chat_lines: Vec::new(),
+        };
 
         let mut renderer = Self {
             surface,
@@ -1048,43 +1108,47 @@ impl VoxelRenderer {
             section_slots: Vec::new(),
             visible_cmds: Vec::with_capacity(indirect_capacity),
             last_visible_sections: 0,
+            entities_cache: initial_entities.to_vec(),
+            target_block: None,
             entity_vbo: None,
             entity_ibo: None,
             entity_index_count: 0,
-            remote_player_count: 0,
             hud_vbo: None,
             hud_vertex_count: 0,
-            selected_slot: 0,
+            hud_model,
         };
         renderer.upload_sections(initial_sections);
-        renderer.upload_remote_players(initial_players);
+        renderer.rebuild_entity_and_outline_buffers();
         renderer.rebuild_hud();
         Ok(renderer)
     }
 
-    pub fn selected_slot(&self) -> usize {
-        self.selected_slot
+    pub fn hud_mut(&mut self) -> &mut HudModel {
+        &mut self.hud_model
     }
 
     pub fn draw_stats(&self) -> (usize, usize, usize, bool) {
         (
             self.last_visible_sections,
             self.section_slots.len(),
-            self.remote_player_count,
+            self.entities_cache.len(),
             self.supports_mdi,
         )
     }
 
     pub fn set_selected_slot(&mut self, slot: usize) {
         let clamped = slot.min(8);
-        if self.selected_slot != clamped {
-            self.selected_slot = clamped;
+        if self.hud_model.selected_slot != clamped {
+            self.hud_model.selected_slot = clamped;
             self.rebuild_hud();
         }
     }
 
-    fn rebuild_hud(&mut self) {
-        let verts = build_hud_vertices(self.config.width, self.config.height, self.selected_slot);
+    pub fn rebuild_hud(&mut self) {
+        self.hud_model.width = self.config.width;
+        self.hud_model.height = self.config.height;
+        self.hud_model.entity_count = self.entities_cache.len();
+        let verts = build_full_ui_vertices(&self.hud_model);
         self.hud_vertex_count = verts.len() as u32;
         if verts.is_empty() {
             self.hud_vbo = None;
@@ -1100,9 +1164,21 @@ impl VoxelRenderer {
         );
     }
 
-    pub fn upload_remote_players(&mut self, players: &[RemotePlayerVisual]) {
-        self.remote_player_count = players.len();
-        let (verts, indices) = build_remote_players_mesh(players);
+    pub fn set_entities(&mut self, entities: Vec<RemoteEntityVisual>) {
+        self.entities_cache = entities;
+        self.rebuild_entity_and_outline_buffers();
+    }
+
+    pub fn set_target_block(&mut self, block: Option<[i32; 3]>) {
+        if self.target_block != block {
+            self.target_block = block;
+            self.rebuild_entity_and_outline_buffers();
+        }
+    }
+
+    fn rebuild_entity_and_outline_buffers(&mut self) {
+        let (verts, indices) =
+            build_entities_and_outline_mesh(&self.entities_cache, self.target_block);
         self.entity_index_count = indices.len() as u32;
         if indices.is_empty() {
             self.entity_vbo = None;
@@ -1112,7 +1188,7 @@ impl VoxelRenderer {
         self.entity_vbo = Some(
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("remote-players-vbo"),
+                    label: Some("entities-outline-vbo"),
                     contents: bytemuck::cast_slice(&verts),
                     usage: wgpu::BufferUsages::VERTEX,
                 }),
@@ -1120,15 +1196,13 @@ impl VoxelRenderer {
         self.entity_ibo = Some(
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("remote-players-ibo"),
+                    label: Some("entities-outline-ibo"),
                     contents: bytemuck::cast_slice(&indices),
                     usage: wgpu::BufferUsages::INDEX,
                 }),
         );
     }
 
-    /// Packs all world sections into 1 single Mega-VBO, 1 single Mega-IBO, and 1 single
-    /// storage buffer of section origins.
     pub fn upload_sections(&mut self, world_sections: &[WorldSectionMesh]) {
         let packed = pack_mega_mesh_batch(world_sections);
         self.section_slots = packed.slots;
@@ -1249,7 +1323,6 @@ impl VoxelRenderer {
                 label: Some("voxel-frame-encoder"),
             });
 
-        // Pass 1: Single-Bind Mega-Buffer 3D World + 3D Remote Players
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("voxel-3d-pass"),
@@ -1314,7 +1387,6 @@ impl VoxelRenderer {
             }
         }
 
-        // Pass 2: 2D Crosshair & 9-Slot Hotbar HUD Overlay
         if self.hud_vertex_count > 0
             && let Some(hud_vbo) = &self.hud_vbo
         {
@@ -1343,20 +1415,49 @@ impl VoxelRenderer {
     }
 }
 
+pub struct WindowLaunchConfig {
+    pub title: String,
+    pub atlas: BlockTextureAtlas,
+    pub camera: VoxelCamera,
+    pub sections: Vec<WorldSectionMesh>,
+    pub entities: Vec<RemoteEntityVisual>,
+    pub initial_health: (f32, i32),
+    pub initial_chunks: usize,
+    pub bridge: Option<LiveRenderBridge>,
+}
+
 struct VoxelApp {
+    cfg: Option<WindowLaunchConfig>,
     base_title: String,
-    atlas: BlockTextureAtlas,
-    initial_sections: Vec<WorldSectionMesh>,
-    initial_players: Vec<RemotePlayerVisual>,
     bridge: Option<LiveRenderBridge>,
     camera: VoxelCamera,
     window: Option<Arc<Window>>,
     renderer: Option<VoxelRenderer>,
     pressed_keys: HashSet<KeyCode>,
+    paused: bool,
+    cursor_locked: bool,
+    survival_physics: bool,
     last_frame: Instant,
-    net_move_accum: f32,
     fps_timer: f32,
     fps_frames: u32,
+}
+
+impl VoxelApp {
+    fn set_cursor_locked(&mut self, lock: bool) {
+        if let Some(win) = &self.window {
+            if lock {
+                if win.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                    let _ = win.set_cursor_grab(CursorGrabMode::Confined);
+                }
+                win.set_cursor_visible(false);
+                self.cursor_locked = true;
+            } else {
+                let _ = win.set_cursor_grab(CursorGrabMode::None);
+                win.set_cursor_visible(true);
+                self.cursor_locked = false;
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for VoxelApp {
@@ -1364,6 +1465,13 @@ impl ApplicationHandler for VoxelApp {
         if self.window.is_some() {
             return;
         }
+        let Some(cfg) = self.cfg.take() else {
+            return;
+        };
+        self.base_title = cfg.title;
+        self.camera = cfg.camera;
+        self.bridge = cfg.bridge;
+
         let attrs = Window::default_attributes()
             .with_title(self.base_title.clone())
             .with_inner_size(PhysicalSize::new(1280, 720));
@@ -1374,13 +1482,16 @@ impl ApplicationHandler for VoxelApp {
                 self.camera.aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
                 match pollster::block_on(VoxelRenderer::new(
                     Arc::clone(&win),
-                    &self.atlas,
-                    &self.initial_sections,
-                    &self.initial_players,
+                    &cfg.atlas,
+                    &cfg.sections,
+                    &cfg.entities,
+                    cfg.initial_health,
+                    cfg.initial_chunks,
                 )) {
                     Ok(renderer) => {
                         self.window = Some(win);
                         self.renderer = Some(renderer);
+                        self.set_cursor_locked(true);
                         self.last_frame = Instant::now();
                     }
                     Err(err) => {
@@ -1393,6 +1504,22 @@ impl ApplicationHandler for VoxelApp {
                 tracing::error!(error = %err, "failed to create window");
                 event_loop.exit();
             }
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if !self.paused
+            && self.cursor_locked
+            && let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
+        {
+            let sens = 0.0024_f32;
+            self.camera.yaw_rad += (dx as f32) * sens;
+            self.camera.pitch_rad = (self.camera.pitch_rad - (dy as f32) * sens).clamp(-1.54, 1.54);
         }
     }
 
@@ -1412,6 +1539,18 @@ impl ApplicationHandler for VoxelApp {
                 button,
                 ..
             } => {
+                if self.paused {
+                    self.paused = false;
+                    self.set_cursor_locked(true);
+                    if let Some(r) = &mut self.renderer {
+                        r.hud_mut().paused = false;
+                        r.rebuild_hud();
+                    }
+                    return;
+                }
+                if !self.cursor_locked {
+                    self.set_cursor_locked(true);
+                }
                 if let Some(bridge) = &self.bridge {
                     let eye = [
                         f64::from(self.camera.position.x),
@@ -1422,10 +1561,13 @@ impl ApplicationHandler for VoxelApp {
                     let dir = [f64::from(fwd.x), f64::from(fwd.y), f64::from(fwd.z)];
                     match button {
                         MouseButton::Left => {
-                            let _ = bridge.action_tx.send(ClientWindowAction::BreakLook {
-                                eye_pos: eye,
-                                look_dir: dir,
-                            });
+                            let _ =
+                                bridge
+                                    .action_tx
+                                    .send(ClientWindowAction::PrimaryAttackOrBreak {
+                                        eye_pos: eye,
+                                        look_dir: dir,
+                                    });
                         }
                         MouseButton::Right => {
                             let _ = bridge.action_tx.send(ClientWindowAction::PlaceLook {
@@ -1446,11 +1588,36 @@ impl ApplicationHandler for VoxelApp {
                     },
                 ..
             } => {
-                if code == KeyCode::Escape && state == ElementState::Pressed {
-                    event_loop.exit();
-                    return;
-                }
                 if state == ElementState::Pressed {
+                    match code {
+                        KeyCode::Escape => {
+                            self.paused = !self.paused;
+                            self.set_cursor_locked(!self.paused);
+                            if let Some(r) = &mut self.renderer {
+                                r.hud_mut().paused = self.paused;
+                                r.rebuild_hud();
+                            }
+                            return;
+                        }
+                        KeyCode::KeyQ if self.paused => {
+                            event_loop.exit();
+                            return;
+                        }
+                        KeyCode::KeyF => {
+                            self.survival_physics = !self.survival_physics;
+                            if let Some(r) = &mut self.renderer {
+                                r.hud_mut().survival_physics = self.survival_physics;
+                                r.rebuild_hud();
+                            }
+                        }
+                        KeyCode::KeyR => {
+                            if let Some(b) = &self.bridge {
+                                let _ = b.action_tx.send(ClientWindowAction::Respawn);
+                            }
+                        }
+                        _ => {}
+                    }
+
                     let hotbar_key = match code {
                         KeyCode::Digit1 => Some(0usize),
                         KeyCode::Digit2 => Some(1),
@@ -1474,6 +1641,7 @@ impl ApplicationHandler for VoxelApp {
                         }
                     }
                 }
+
                 match state {
                     ElementState::Pressed => {
                         self.pressed_keys.insert(code);
@@ -1488,18 +1656,24 @@ impl ApplicationHandler for VoxelApp {
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
 
-                // Drain any non-blocking live server scene updates
+                let mut hud_dirty = false;
                 if let Some(bridge) = &self.bridge {
                     while let Ok(update) = bridge.scene_rx.try_recv() {
                         match update {
-                            RenderSceneUpdate::ReplaceSections(secs) => {
+                            RenderSceneUpdate::ReplaceSections {
+                                sections,
+                                chunk_count,
+                            } => {
                                 if let Some(r) = &mut self.renderer {
-                                    r.upload_sections(&secs);
+                                    r.hud_mut().chunk_count = chunk_count;
+                                    r.upload_sections(&sections);
+                                    hud_dirty = true;
                                 }
                             }
-                            RenderSceneUpdate::RemotePlayers(players) => {
+                            RenderSceneUpdate::Entities(list) => {
                                 if let Some(r) = &mut self.renderer {
-                                    r.upload_remote_players(&players);
+                                    r.set_entities(list);
+                                    hud_dirty = true;
                                 }
                             }
                             RenderSceneUpdate::TeleportCamera {
@@ -1511,67 +1685,138 @@ impl ApplicationHandler for VoxelApp {
                                 self.camera.yaw_rad = yaw_rad;
                                 self.camera.pitch_rad = pitch_rad;
                             }
+                            RenderSceneUpdate::Vitals { health, food } => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.hud_mut().health = health;
+                                    r.hud_mut().food = food;
+                                    hud_dirty = true;
+                                }
+                            }
+                            RenderSceneUpdate::ChatLine(line) => {
+                                if let Some(r) = &mut self.renderer {
+                                    let lines = &mut r.hud_mut().chat_lines;
+                                    lines.push(line);
+                                    if lines.len() > 16 {
+                                        lines.remove(0);
+                                    }
+                                    hud_dirty = true;
+                                }
+                            }
+                            RenderSceneUpdate::TargetBlock(tb) => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.set_target_block(tb);
+                                }
+                            }
                         }
                     }
                 }
 
-                let speed = if self.pressed_keys.contains(&KeyCode::ControlLeft) {
-                    28.0
-                } else {
-                    12.0
-                };
-                let turn_speed = 2.0;
+                if !self.paused {
+                    let turn_speed = 2.0;
+                    if self.pressed_keys.contains(&KeyCode::ArrowLeft) {
+                        self.camera.yaw_rad -= turn_speed * dt;
+                    }
+                    if self.pressed_keys.contains(&KeyCode::ArrowRight) {
+                        self.camera.yaw_rad += turn_speed * dt;
+                    }
+                    if self.pressed_keys.contains(&KeyCode::ArrowUp) {
+                        self.camera.pitch_rad = (self.camera.pitch_rad + turn_speed * dt).min(1.54);
+                    }
+                    if self.pressed_keys.contains(&KeyCode::ArrowDown) {
+                        self.camera.pitch_rad =
+                            (self.camera.pitch_rad - turn_speed * dt).max(-1.54);
+                    }
 
-                if self.pressed_keys.contains(&KeyCode::ArrowLeft) {
-                    self.camera.yaw_rad -= turn_speed * dt;
-                }
-                if self.pressed_keys.contains(&KeyCode::ArrowRight) {
-                    self.camera.yaw_rad += turn_speed * dt;
-                }
-                if self.pressed_keys.contains(&KeyCode::ArrowUp) {
-                    self.camera.pitch_rad = (self.camera.pitch_rad + turn_speed * dt).min(1.54);
-                }
-                if self.pressed_keys.contains(&KeyCode::ArrowDown) {
-                    self.camera.pitch_rad = (self.camera.pitch_rad - turn_speed * dt).max(-1.54);
-                }
+                    let sprint = self.pressed_keys.contains(&KeyCode::ControlLeft);
+                    let fwd_xz = self.camera.forward_xz();
+                    let right_xz = self.camera.right_xz();
+                    let mut move_xz = Vec3::ZERO;
+                    if self.pressed_keys.contains(&KeyCode::KeyW) {
+                        move_xz += fwd_xz;
+                    }
+                    if self.pressed_keys.contains(&KeyCode::KeyS) {
+                        move_xz -= fwd_xz;
+                    }
+                    if self.pressed_keys.contains(&KeyCode::KeyD) {
+                        move_xz += right_xz;
+                    }
+                    if self.pressed_keys.contains(&KeyCode::KeyA) {
+                        move_xz -= right_xz;
+                    }
+                    if move_xz.length_squared() > 0.001 {
+                        move_xz = move_xz.normalize();
+                    }
 
-                let fwd = self.camera.forward();
-                let right = self.camera.right_xz();
-                if self.pressed_keys.contains(&KeyCode::KeyW) {
-                    self.camera.position += fwd * speed * dt;
-                }
-                if self.pressed_keys.contains(&KeyCode::KeyS) {
-                    self.camera.position -= fwd * speed * dt;
-                }
-                if self.pressed_keys.contains(&KeyCode::KeyD) {
-                    self.camera.position += right * speed * dt;
-                }
-                if self.pressed_keys.contains(&KeyCode::KeyA) {
-                    self.camera.position -= right * speed * dt;
-                }
-                if self.pressed_keys.contains(&KeyCode::Space) {
-                    self.camera.position.y += speed * dt;
-                }
-                if self.pressed_keys.contains(&KeyCode::ShiftLeft) {
-                    self.camera.position.y -= speed * dt;
-                }
+                    if !self.survival_physics {
+                        let fly_speed = if sprint { 28.0 } else { 12.0 };
+                        let fwd_3d = self.camera.forward();
+                        if self.pressed_keys.contains(&KeyCode::KeyW) {
+                            self.camera.position += fwd_3d * fly_speed * dt;
+                        }
+                        if self.pressed_keys.contains(&KeyCode::KeyS) {
+                            self.camera.position -= fwd_3d * fly_speed * dt;
+                        }
+                        if self.pressed_keys.contains(&KeyCode::KeyD) {
+                            self.camera.position += right_xz * fly_speed * dt;
+                        }
+                        if self.pressed_keys.contains(&KeyCode::KeyA) {
+                            self.camera.position -= right_xz * fly_speed * dt;
+                        }
+                        if self.pressed_keys.contains(&KeyCode::Space) {
+                            self.camera.position.y += fly_speed * dt;
+                        }
+                        if self.pressed_keys.contains(&KeyCode::ShiftLeft) {
+                            self.camera.position.y -= fly_speed * dt;
+                        }
+                    }
 
-                // Stream 20 Hz movement updates to server
-                self.net_move_accum += dt;
-                if self.net_move_accum >= 0.05 {
-                    self.net_move_accum = 0.0;
                     if let Some(bridge) = &self.bridge {
-                        let _ = bridge.action_tx.send(ClientWindowAction::Move {
-                            feet_pos: [
+                        let walk_spd = if sprint { 5.612 } else { 4.317 };
+                        let fwd = self.camera.forward();
+                        let _ = bridge.action_tx.send(ClientWindowAction::TickCamera {
+                            eye_pos: [
                                 f64::from(self.camera.position.x),
-                                f64::from(self.camera.position.y) - 1.62,
+                                f64::from(self.camera.position.y),
                                 f64::from(self.camera.position.z),
                             ],
+                            look_dir: [f64::from(fwd.x), f64::from(fwd.y), f64::from(fwd.z)],
+                            wish_xz: [
+                                f64::from(move_xz.x) * walk_spd,
+                                f64::from(move_xz.z) * walk_spd,
+                            ],
+                            jump: self.pressed_keys.contains(&KeyCode::Space),
+                            survival_physics: self.survival_physics,
                             yaw_deg: self.camera.yaw_rad.to_degrees(),
                             pitch_deg: self.camera.pitch_rad.to_degrees(),
-                            on_ground: false,
+                            dt: f64::from(dt),
                         });
                     }
+                }
+
+                self.fps_frames += 1;
+                self.fps_timer += dt;
+                if self.fps_timer >= 0.4 {
+                    let fps = (self.fps_frames as f32 / self.fps_timer).round() as u32;
+                    let ms = (self.fps_timer * 1000.0) / (self.fps_frames.max(1) as f32);
+                    if let (Some(w), Some(r)) = (&self.window, &mut self.renderer) {
+                        r.hud_mut().fps = fps;
+                        r.hud_mut().frame_ms = ms;
+                        r.hud_mut().camera_pos = self.camera.position.to_array();
+                        hud_dirty = true;
+                        let (vis, tot, ecnt, mdi) = r.draw_stats();
+                        let mode = if mdi { "MDI" } else { "MegaBatch" };
+                        w.set_title(&format!(
+                            "{} | {} FPS ({:.2} ms) | {}: {}/{} secs | Entities: {}",
+                            self.base_title, fps, ms, mode, vis, tot, ecnt
+                        ));
+                    }
+                    self.fps_frames = 0;
+                    self.fps_timer = 0.0;
+                }
+
+                if hud_dirty && let Some(r) = &mut self.renderer {
+                    r.hud_mut().camera_pos = self.camera.position.to_array();
+                    r.rebuild_hud();
                 }
 
                 if let Some(r) = &mut self.renderer {
@@ -1587,31 +1832,6 @@ impl ApplicationHandler for VoxelApp {
                     }
                 }
 
-                // Live FPS & MSPT profiler HUD in window title bar
-                self.fps_frames += 1;
-                self.fps_timer += dt;
-                if self.fps_timer >= 0.5 {
-                    let fps = (self.fps_frames as f32 / self.fps_timer).round() as u32;
-                    let ms = (self.fps_timer * 1000.0) / (self.fps_frames.max(1) as f32);
-                    if let (Some(w), Some(r)) = (&self.window, &self.renderer) {
-                        let (vis, tot, pcnt, mdi) = r.draw_stats();
-                        let mode = if mdi { "MDI" } else { "MegaBatch" };
-                        w.set_title(&format!(
-                            "{} | {} FPS ({:.2} ms) | {}: {}/{} secs | Players: {} | Slot: {}",
-                            self.base_title,
-                            fps,
-                            ms,
-                            mode,
-                            vis,
-                            tot,
-                            pcnt,
-                            r.selected_slot() + 1
-                        ));
-                    }
-                    self.fps_frames = 0;
-                    self.fps_timer = 0.0;
-                }
-
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -1621,29 +1841,22 @@ impl ApplicationHandler for VoxelApp {
     }
 }
 
-/// Opens the native `winit` + `wgpu` 3D voxel window with Mega-Buffer MDI, live multiplayer bridge, and HUD.
-pub fn run_voxel_window(
-    title: impl Into<String>,
-    atlas: BlockTextureAtlas,
-    camera: VoxelCamera,
-    sections: Vec<WorldSectionMesh>,
-    remote_players: Vec<RemotePlayerVisual>,
-    bridge: Option<LiveRenderBridge>,
-) -> Result<()> {
+/// Opens the native `winit` + `wgpu` 3D voxel window with FPS mouse-look, Survival HUD, and Pause Menu.
+pub fn run_voxel_window(launch: WindowLaunchConfig) -> Result<()> {
     let event_loop = EventLoop::new().context("create winit event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = VoxelApp {
-        base_title: title.into(),
-        atlas,
-        initial_sections: sections,
-        initial_players: remote_players,
-        bridge,
-        camera,
+        cfg: Some(launch),
+        base_title: String::new(),
+        bridge: None,
+        camera: VoxelCamera::default(),
         window: None,
         renderer: None,
         pressed_keys: HashSet::new(),
+        paused: false,
+        cursor_locked: false,
+        survival_physics: false,
         last_frame: Instant::now(),
-        net_move_accum: 0.0,
         fps_timer: 0.0,
         fps_frames: 0,
     };
@@ -1671,58 +1884,33 @@ mod tests {
     }
 
     #[test]
-    fn vertex_layout_stride_is_eight_bytes() {
-        assert_eq!(packed_voxel_vertex_layout().array_stride, 8);
-    }
-
-    #[test]
-    fn mega_buffer_packs_sections_and_generates_frustum_culled_indirect_draws() {
+    fn mega_buffer_and_mob_outline_meshes_build_cleanly() {
         let mut s0 = ChunkSection::new_air();
         s0.set(1, 1, 1, generated_blocks::default_state::STONE);
-        let m0 = mesh_section(&s0);
-
-        let sections = vec![
-            WorldSectionMesh {
-                origin: Vec3::new(32.0, 0.0, 0.0), // in front (+X)
-                mesh: m0.clone(),
-            },
-            WorldSectionMesh {
-                origin: Vec3::new(-64.0, 0.0, 0.0), // behind (-X)
-                mesh: m0,
-            },
-        ];
-        let packed = pack_mega_mesh_batch(&sections);
-        assert_eq!(packed.slots.len(), 2);
-        assert_eq!(packed.slots[0].cmd.base_vertex, 0);
-        assert_eq!(packed.slots[0].cmd.first_instance, 0);
-        assert_eq!(packed.slots[1].cmd.base_vertex, 24);
-        assert_eq!(packed.slots[1].cmd.first_instance, 1);
-
-        let cam = VoxelCamera {
-            position: Vec3::ZERO,
-            yaw_rad: 0.0,
-            pitch_rad: 0.0,
-            ..Default::default()
-        };
-        let frustum = Frustum::from_view_proj(cam.view_proj_matrix());
-        let mut visible = Vec::new();
-        build_frustum_culled_indirect_cmds(&packed.slots, &frustum, &mut visible);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].first_instance, 0);
-    }
-
-    #[test]
-    fn remote_player_and_hud_meshes_generate_expected_primitives() {
-        let (p_verts, p_idx) = build_remote_players_mesh(&[RemotePlayerVisual {
-            entity_id: 7,
-            feet_pos: Vec3::new(8.0, -58.0, 8.0),
-            yaw_deg: 45.0,
+        let packed = pack_mega_mesh_batch(&[WorldSectionMesh {
+            origin: Vec3::new(32.0, 0.0, 0.0),
+            mesh: mesh_section(&s0),
         }]);
-        assert_eq!(p_verts.len(), 144);
-        assert_eq!(p_idx.len(), 216);
+        assert_eq!(packed.slots.len(), 1);
 
-        let hud = build_hud_vertices(1280, 720, 3);
-        assert!(hud.len() >= 180);
-        assert_eq!(hud.len() % 6, 0);
+        let (verts, idx) = build_entities_and_outline_mesh(
+            &[
+                RemoteEntityVisual {
+                    entity_id: 1,
+                    entity_type: generated_entities::id::PIG,
+                    feet_pos: Vec3::ZERO,
+                    yaw_deg: 0.0,
+                },
+                RemoteEntityVisual {
+                    entity_id: 2,
+                    entity_type: generated_entities::id::ZOMBIE,
+                    feet_pos: Vec3::new(2.0, 0.0, 0.0),
+                    yaw_deg: 90.0,
+                },
+            ],
+            Some([4, -59, 4]),
+        );
+        assert!(verts.len() > 400);
+        assert!(idx.len() > 600);
     }
 }

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Solara-Ground
+Comment=Native Rust client for Minecraft: Java Edition (launched via Solara Launcher)
+Exec=solara-ground
+Terminal=false
+Categories=Game;

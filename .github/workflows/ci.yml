@@ -46,5 +46,9 @@ jobs:
           cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run Tests
         run: cargo test --workspace --all-features --verbose
-      - name: Build Release-Safe Default Binary
-        run: cargo build --bin solara-ground
+      - name: Build Release-Safe Default Binaries
+        run: cargo build --bin solara-ground --bin mc-codegen
+      - name: Smoke Check Binaries (--help)
+        run: |
+          cargo run --bin solara-ground -- --help
+          cargo run --bin mc-codegen -- --help

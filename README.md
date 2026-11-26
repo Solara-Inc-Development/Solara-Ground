@@ -15,10 +15,14 @@ An open-source **Minecraft: Java Edition** client written in native Rust (`wgpu`
 
 ## Workspace Layout
 
-- `crates/ground-protocol` — MC `26.3` (`777`) protocol primitives, online-mode session join & AES-128-CFB8 encryption, and async Server List Ping client
-- `crates/ground-world` — Bit-packed paletted chunks, generated MC `26.3` block metadata, and compact 8-byte face-culling voxel chunk mesher
-- `crates/ground-render` — `wgpu` + `winit` renderer configuration, camera projection, and 6-plane frustum culling
-- `crates/ground-client` — `solara-ground` client binary (`SessionConfig` with redacted token handling + live `--ping <host:port>` mode)
+- `crates/ground-data` — Generated MC `26.3` (`777`) items (`1,658`), entity types (`161`) + hitboxes, sound events (`1,991`), particles (`128`), and mob effects (`40`)
+- `crates/ground-protocol` — MC `26.3` (`777`) protocol primitives, online-mode session join & AES-128-CFB8 encryption, and Play/Survival client codecs
+- `crates/ground-world` — Bit-packed paletted chunks, `SectionLight`, `rayon` multi-core 2D greedy voxel mesher (`8`-byte vertices), AABB physics, DDA raycaster & `LocalMojangAssets`
+- `crates/ground-ui` — Clean-room `5x7` bitmap pixel font, F3-lite telemetry, 10 Survival Hearts, 10 Hunger icons, 9-slot hotbar, chat feed & `Esc` Pause/Settings menu
+- `crates/ground-audio` — Clean-room procedural 16-bit PCM SFX synthesizer & 3D spatial sound attenuation
+- `crates/ground-render` — `wgpu` + `winit` single-VBO Mega-Buffer + `multi_draw_indexed_indirect` renderer, `16x16` 2D texture array, 3D players & mobs, block selection outline & FPS mouse-look
+- `crates/ground-client` — `solara-ground` client binary (`SessionConfig` with redacted token handling + live multiplayer bridge)
+- `docs/` & `packaging/` — Architecture, GPU pipeline, EULA compliance docs & desktop entry
 - `tools/mc-codegen` — Code generator from Mojang official `--reports` JSON
 
 ## Building & Testing
