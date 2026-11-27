@@ -5,8 +5,8 @@
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
-use ground_data::generated_entities;
-use ground_ui::{HudModel, UiVertex, build_full_ui_vertices};
+use ground_data::{generated_entities, generated_items};
+use ground_ui::{HudModel, QUICK_CRAFT_RECIPES, UiSlotDisplay, UiVertex, build_full_ui_vertices};
 use ground_world::assets::{
     ATLAS_LAYER_COUNT, BlockTextureAtlas, TILE_SIZE, procedural_block_color,
 };
@@ -19,7 +19,9 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -54,12 +56,19 @@ pub enum RenderSceneUpdate {
         health: f32,
         food: i32,
     },
+    DayTime(i64),
+    InventorySlot {
+        slot: usize,
+        item_id: u32,
+        count: u8,
+    },
     ChatLine(String),
+    TabHint(String),
     TargetBlock(Option<[i32; 3]>),
 }
 
 /// Non-blocking gameplay actions pushed from the `winit` window thread to the network worker.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ClientWindowAction {
     TickCamera {
         eye_pos: [f64; 3],
@@ -79,7 +88,11 @@ pub enum ClientWindowAction {
     PlaceLook {
         eye_pos: [f64; 3],
         look_dir: [f64; 3],
+        yaw_deg: f32,
+        pitch_deg: f32,
     },
+    SendChatOrCommand(String),
+    RequestTabComplete(String),
     Respawn,
 }
 
@@ -329,6 +342,19 @@ pub fn build_entities_and_outline_mesh(
     for e in entities {
         let yaw_rad = e.yaw_deg.to_radians();
         match e.entity_type {
+            generated_entities::id::ITEM => {
+                let spin = (e.entity_id as f32) * 0.75 + e.yaw_deg.to_radians();
+                let loot_pos = e.feet_pos + Vec3::new(0.0, 0.16, 0.0);
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    loot_pos,
+                    spin,
+                    Vec3::new(-0.14, 0.0, -0.14),
+                    Vec3::new(0.14, 0.28, 0.14),
+                    [246, 214, 92, 255],
+                );
+            }
             generated_entities::id::PIG
             | generated_entities::id::COW
             | generated_entities::id::SHEEP => {
@@ -645,6 +671,87 @@ pub struct WorldSectionMesh {
 struct CameraUniformRaw {
     view_proj: [[f32; 4]; 4],
     camera_pos_fog: [f32; 4],
+    sky_fog_sun: [f32; 4],
+}
+
+/// Computes dynamic Overworld `(sky_rgb, sunlight_multiplier)` from MC `26.3` `day_time` (`0..24000`).
+pub fn compute_sky_fog_and_sun(day_time_ticks: i64) -> ([f32; 3], f32) {
+    let t = (day_time_ticks.rem_euclid(24_000) as f32) / 24_000.0;
+    // t=0.0 (06:00 dawn), t=0.25 (12:00 noon), t=0.52 (sunset), t=0.75 (midnight)
+    if t < 0.45 {
+        ([0.20, 0.44, 0.96], 1.0)
+    } else if t < 0.56 {
+        let k = (t - 0.45) / 0.11;
+        (
+            [0.20 + 0.62 * k, 0.44 - 0.10 * k, 0.96 - 0.58 * k],
+            1.0 - 0.45 * k,
+        )
+    } else if t < 0.64 {
+        let k = (t - 0.56) / 0.08;
+        (
+            [0.82 - 0.78 * k, 0.34 - 0.29 * k, 0.38 - 0.24 * k],
+            0.55 - 0.33 * k,
+        )
+    } else if t < 0.92 {
+        ([0.04, 0.05, 0.14], 0.22)
+    } else {
+        let k = (t - 0.92) / 0.08;
+        (
+            [0.04 + 0.16 * k, 0.05 + 0.39 * k, 0.14 + 0.82 * k],
+            0.22 + 0.78 * k,
+        )
+    }
+}
+
+/// Resolves zero-allocation `UiSlotDisplay` metadata & clean-room colors for any MC `26.3` item ID!
+pub fn ui_slot_for_item(item_id: u32, count: u8) -> UiSlotDisplay {
+    if item_id == 0 || count == 0 {
+        return UiSlotDisplay::default();
+    }
+    let Some(def) = generated_items::by_id(item_id) else {
+        return UiSlotDisplay {
+            count,
+            label: "item",
+            top_color: [180, 180, 190, 255],
+            side_color: [140, 140, 150, 255],
+        };
+    };
+    let short = def.key.strip_prefix("minecraft:").unwrap_or(def.key);
+    if let Some(st) = generated_blocks::BLOCK_RANGES
+        .iter()
+        .find(|r| r.name == def.key)
+        .map(|r| r.default_state_id)
+    {
+        return UiSlotDisplay {
+            count,
+            label: short,
+            top_color: procedural_block_color(st, true),
+            side_color: procedural_block_color(st, false),
+        };
+    }
+    let (top_color, side_color) = if short.contains("diamond") {
+        ([110, 246, 238, 255], [72, 198, 192, 255])
+    } else if short.contains("iron") {
+        ([228, 232, 238, 255], [178, 184, 192, 255])
+    } else if short.contains("gold") {
+        ([250, 216, 86, 255], [212, 168, 48, 255])
+    } else if short.contains("stone_") {
+        ([156, 158, 164, 255], [116, 118, 124, 255])
+    } else if short.contains("wooden_") || short == "stick" {
+        ([182, 142, 86, 255], [138, 102, 58, 255])
+    } else if short == "coal" {
+        ([54, 54, 60, 255], [36, 36, 42, 255])
+    } else if short.contains("bread") || short.contains("cooked") {
+        ([218, 152, 74, 255], [172, 108, 46, 255])
+    } else {
+        ([226, 116, 106, 255], [182, 82, 74, 255])
+    };
+    UiSlotDisplay {
+        count,
+        label: short,
+        top_color,
+        side_color,
+    }
 }
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -713,12 +820,16 @@ pub struct VoxelRenderer {
 }
 
 impl VoxelRenderer {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         window: Arc<Window>,
         atlas: &BlockTextureAtlas,
         initial_sections: &[WorldSectionMesh],
         initial_entities: &[RemoteEntityVisual],
         initial_health: (f32, i32),
+        initial_day_time: i64,
+        initial_inventory: &[(u32, u8); 36],
+        initial_survival: bool,
         initial_chunk_count: usize,
     ) -> Result<Self> {
         let size = window.inner_size();
@@ -827,7 +938,7 @@ impl VoxelRenderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -883,6 +994,7 @@ impl VoxelRenderer {
             contents: bytemuck::bytes_of(&CameraUniformRaw {
                 view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                 camera_pos_fog: [0.0, 0.0, 0.0, 256.0],
+                sky_fog_sun: [0.20, 0.44, 0.96, 1.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1067,16 +1179,27 @@ impl VoxelRenderer {
         });
 
         let (tops, sides) = hotbar_icon_colors();
+        let mut inv_slots = [UiSlotDisplay::default(); 36];
+        for (idx, &(iid, cnt)) in initial_inventory.iter().enumerate() {
+            inv_slots[idx] = ui_slot_for_item(iid, cnt);
+        }
         let hud_model = HudModel {
             width: config.width,
             height: config.height,
             selected_slot: 0,
             hotbar_top_colors: tops,
             hotbar_side_colors: sides,
+            inventory_slots: inv_slots,
             health: initial_health.0,
             food: initial_health.1,
-            survival_physics: false,
+            day_time_ticks: initial_day_time,
+            hand_swing: 0.0,
+            survival_physics: initial_survival,
             paused: false,
+            inventory_open: false,
+            chat_open: false,
+            chat_input: String::new(),
+            tab_hint: String::new(),
             fps: 0,
             frame_ms: 0.0,
             camera_pos: [8.0, -56.0, 8.0],
@@ -1286,6 +1409,7 @@ impl VoxelRenderer {
     pub fn render(&mut self, camera: &VoxelCamera) -> std::result::Result<(), wgpu::SurfaceError> {
         let vp = camera.view_proj_matrix();
         let frustum = Frustum::from_view_proj(vp);
+        let (sky_rgb, sun_mult) = compute_sky_fog_and_sun(self.hud_model.day_time_ticks);
 
         self.queue.write_buffer(
             &self.camera_buf,
@@ -1298,6 +1422,7 @@ impl VoxelRenderer {
                     camera.position.z,
                     camera.z_far * 0.65,
                 ],
+                sky_fog_sun: [sky_rgb[0], sky_rgb[1], sky_rgb[2], sun_mult],
             }),
         );
 
@@ -1331,9 +1456,9 @@ impl VoxelRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.20,
-                            g: 0.42,
-                            b: 0.95,
+                            r: f64::from(sky_rgb[0]),
+                            g: f64::from(sky_rgb[1]),
+                            b: f64::from(sky_rgb[2]),
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -1422,6 +1547,9 @@ pub struct WindowLaunchConfig {
     pub sections: Vec<WorldSectionMesh>,
     pub entities: Vec<RemoteEntityVisual>,
     pub initial_health: (f32, i32),
+    pub initial_day_time: i64,
+    pub initial_inventory: [(u32, u8); 36],
+    pub initial_survival: bool,
     pub initial_chunks: usize,
     pub bridge: Option<LiveRenderBridge>,
 }
@@ -1435,8 +1563,12 @@ struct VoxelApp {
     renderer: Option<VoxelRenderer>,
     pressed_keys: HashSet<KeyCode>,
     paused: bool,
+    inventory_open: bool,
+    chat_open: bool,
     cursor_locked: bool,
     survival_physics: bool,
+    swing_timer: f32,
+    backpack_cycle_idx: usize,
     last_frame: Instant,
     fps_timer: f32,
     fps_frames: u32,
@@ -1471,6 +1603,7 @@ impl ApplicationHandler for VoxelApp {
         self.base_title = cfg.title;
         self.camera = cfg.camera;
         self.bridge = cfg.bridge;
+        self.survival_physics = cfg.initial_survival;
 
         let attrs = Window::default_attributes()
             .with_title(self.base_title.clone())
@@ -1486,6 +1619,9 @@ impl ApplicationHandler for VoxelApp {
                     &cfg.sections,
                     &cfg.entities,
                     cfg.initial_health,
+                    cfg.initial_day_time,
+                    &cfg.initial_inventory,
+                    cfg.initial_survival,
                     cfg.initial_chunks,
                 )) {
                     Ok(renderer) => {
@@ -1514,6 +1650,8 @@ impl ApplicationHandler for VoxelApp {
         event: DeviceEvent,
     ) {
         if !self.paused
+            && !self.inventory_open
+            && !self.chat_open
             && self.cursor_locked
             && let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
         {
@@ -1534,11 +1672,51 @@ impl ApplicationHandler for VoxelApp {
                     r.resize(size);
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.paused || self.inventory_open || self.chat_open {
+                    return;
+                }
+                let step: isize = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        if y > 0.1 {
+                            -1
+                        } else if y < -0.1 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    MouseScrollDelta::PixelDelta(p) => {
+                        if p.y > 4.0 {
+                            -1
+                        } else if p.y < -4.0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                };
+                if step != 0
+                    && let Some(r) = &mut self.renderer
+                {
+                    let cur = r.hud_mut().selected_slot as isize;
+                    let next = (cur + step).rem_euclid(9) as usize;
+                    r.set_selected_slot(next);
+                    if let Some(b) = &self.bridge {
+                        let _ = b
+                            .action_tx
+                            .send(ClientWindowAction::SelectHotbarSlot(next as u16));
+                    }
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button,
                 ..
             } => {
+                if self.chat_open || self.inventory_open {
+                    return;
+                }
                 if self.paused {
                     self.paused = false;
                     self.set_cursor_locked(true);
@@ -1551,6 +1729,7 @@ impl ApplicationHandler for VoxelApp {
                 if !self.cursor_locked {
                     self.set_cursor_locked(true);
                 }
+                self.swing_timer = 1.0;
                 if let Some(bridge) = &self.bridge {
                     let eye = [
                         f64::from(self.camera.position.x),
@@ -1573,6 +1752,8 @@ impl ApplicationHandler for VoxelApp {
                             let _ = bridge.action_tx.send(ClientWindowAction::PlaceLook {
                                 eye_pos: eye,
                                 look_dir: dir,
+                                yaw_deg: self.camera.yaw_rad.to_degrees(),
+                                pitch_deg: self.camera.pitch_rad.to_degrees(),
                             });
                         }
                         _ => {}
@@ -1584,18 +1765,171 @@ impl ApplicationHandler for VoxelApp {
                     KeyEvent {
                         physical_key: PhysicalKey::Code(code),
                         state,
+                        text,
                         ..
                     },
                 ..
             } => {
+                if self.chat_open {
+                    if state == ElementState::Pressed {
+                        match code {
+                            KeyCode::Escape => {
+                                self.chat_open = false;
+                                self.set_cursor_locked(true);
+                                if let Some(r) = &mut self.renderer {
+                                    r.hud_mut().chat_open = false;
+                                    r.hud_mut().chat_input.clear();
+                                    r.hud_mut().tab_hint.clear();
+                                    r.rebuild_hud();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let msg = self
+                                    .renderer
+                                    .as_mut()
+                                    .map(|r| std::mem::take(&mut r.hud_mut().chat_input))
+                                    .unwrap_or_default();
+                                self.chat_open = false;
+                                self.set_cursor_locked(true);
+                                if let Some(r) = &mut self.renderer {
+                                    r.hud_mut().chat_open = false;
+                                    r.hud_mut().tab_hint.clear();
+                                    r.rebuild_hud();
+                                }
+                                if !msg.trim().is_empty()
+                                    && let Some(b) = &self.bridge
+                                {
+                                    let _ = b
+                                        .action_tx
+                                        .send(ClientWindowAction::SendChatOrCommand(msg));
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.hud_mut().chat_input.pop();
+                                    let cur = r.hud_mut().chat_input.clone();
+                                    r.rebuild_hud();
+                                    if cur.starts_with('/')
+                                        && let Some(b) = &self.bridge
+                                    {
+                                        let _ = b
+                                            .action_tx
+                                            .send(ClientWindowAction::RequestTabComplete(cur));
+                                    }
+                                }
+                            }
+                            KeyCode::Tab => {
+                                if let Some(r) = &mut self.renderer {
+                                    let hint = r.hud_mut().tab_hint.clone();
+                                    if !hint.is_empty() {
+                                        let input = &mut r.hud_mut().chat_input;
+                                        if let Some((prefix, _)) = input.rsplit_once(' ') {
+                                            *input = format!("{prefix} {hint}");
+                                        } else {
+                                            *input = format!("/{hint} ");
+                                        }
+                                        r.hud_mut().tab_hint.clear();
+                                        r.rebuild_hud();
+                                    } else if r.hud_mut().chat_input.starts_with('/')
+                                        && let Some(b) = &self.bridge
+                                    {
+                                        let _ = b.action_tx.send(
+                                            ClientWindowAction::RequestTabComplete(
+                                                r.hud_mut().chat_input.clone(),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some(txt) = text.as_deref()
+                                    && let Some(r) = &mut self.renderer
+                                {
+                                    let mut changed = false;
+                                    for ch in txt.chars() {
+                                        if ch.is_ascii() && !ch.is_ascii_control() {
+                                            r.hud_mut().chat_input.push(ch);
+                                            changed = true;
+                                        }
+                                    }
+                                    if changed {
+                                        let cur = r.hud_mut().chat_input.clone();
+                                        r.rebuild_hud();
+                                        if cur.starts_with('/')
+                                            && let Some(b) = &self.bridge
+                                        {
+                                            let _ = b
+                                                .action_tx
+                                                .send(ClientWindowAction::RequestTabComplete(cur));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if state == ElementState::Pressed {
                     match code {
                         KeyCode::Escape => {
+                            if self.inventory_open {
+                                self.inventory_open = false;
+                                self.set_cursor_locked(true);
+                                if let Some(r) = &mut self.renderer {
+                                    r.hud_mut().inventory_open = false;
+                                    r.rebuild_hud();
+                                }
+                                return;
+                            }
                             self.paused = !self.paused;
                             self.set_cursor_locked(!self.paused);
                             if let Some(r) = &mut self.renderer {
                                 r.hud_mut().paused = self.paused;
                                 r.rebuild_hud();
+                            }
+                            return;
+                        }
+                        KeyCode::KeyE => {
+                            self.paused = false;
+                            self.inventory_open = !self.inventory_open;
+                            self.set_cursor_locked(!self.inventory_open);
+                            self.pressed_keys.clear();
+                            if let Some(r) = &mut self.renderer {
+                                r.hud_mut().paused = false;
+                                r.hud_mut().inventory_open = self.inventory_open;
+                                r.rebuild_hud();
+                            }
+                            return;
+                        }
+                        KeyCode::KeyT | KeyCode::Slash if !self.paused && !self.inventory_open => {
+                            self.chat_open = true;
+                            self.set_cursor_locked(false);
+                            self.pressed_keys.clear();
+                            if let Some(r) = &mut self.renderer {
+                                r.hud_mut().chat_open = true;
+                                r.hud_mut().chat_input = if code == KeyCode::Slash {
+                                    "/".into()
+                                } else {
+                                    String::new()
+                                };
+                                r.hud_mut().tab_hint.clear();
+                                r.rebuild_hud();
+                            }
+                            return;
+                        }
+                        KeyCode::KeyX if self.inventory_open => {
+                            if let Some(r) = &mut self.renderer {
+                                let sel = r.hud_mut().selected_slot.min(8);
+                                for off in 0..27usize {
+                                    let bp_idx = 9 + ((self.backpack_cycle_idx + off) % 27);
+                                    if r.hud_mut().inventory_slots[bp_idx].count > 0 {
+                                        r.hud_mut().inventory_slots.swap(sel, bp_idx);
+                                        self.backpack_cycle_idx = (bp_idx - 9 + 1) % 27;
+                                        r.rebuild_hud();
+                                        break;
+                                    }
+                                }
                             }
                             return;
                         }
@@ -1618,7 +1952,7 @@ impl ApplicationHandler for VoxelApp {
                         _ => {}
                     }
 
-                    let hotbar_key = match code {
+                    let digit_key = match code {
                         KeyCode::Digit1 => Some(0usize),
                         KeyCode::Digit2 => Some(1),
                         KeyCode::Digit3 => Some(2),
@@ -1630,14 +1964,24 @@ impl ApplicationHandler for VoxelApp {
                         KeyCode::Digit9 => Some(8),
                         _ => None,
                     };
-                    if let Some(slot) = hotbar_key {
-                        if let Some(r) = &mut self.renderer {
-                            r.set_selected_slot(slot);
-                        }
-                        if let Some(b) = &self.bridge {
-                            let _ = b
-                                .action_tx
-                                .send(ClientWindowAction::SelectHotbarSlot(slot as u16));
+                    if let Some(slot) = digit_key {
+                        if self.inventory_open {
+                            if let Some(&(recipe_key, _)) = QUICK_CRAFT_RECIPES.get(slot)
+                                && let Some(b) = &self.bridge
+                            {
+                                let _ = b.action_tx.send(ClientWindowAction::SendChatOrCommand(
+                                    format!("/craft {recipe_key}"),
+                                ));
+                            }
+                        } else {
+                            if let Some(r) = &mut self.renderer {
+                                r.set_selected_slot(slot);
+                            }
+                            if let Some(b) = &self.bridge {
+                                let _ = b
+                                    .action_tx
+                                    .send(ClientWindowAction::SelectHotbarSlot(slot as u16));
+                            }
                         }
                     }
                 }
@@ -1692,6 +2036,25 @@ impl ApplicationHandler for VoxelApp {
                                     hud_dirty = true;
                                 }
                             }
+                            RenderSceneUpdate::DayTime(dt_ticks) => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.hud_mut().day_time_ticks = dt_ticks;
+                                    hud_dirty = true;
+                                }
+                            }
+                            RenderSceneUpdate::InventorySlot {
+                                slot,
+                                item_id,
+                                count,
+                            } => {
+                                if let Some(r) = &mut self.renderer
+                                    && slot < r.hud_mut().inventory_slots.len()
+                                {
+                                    r.hud_mut().inventory_slots[slot] =
+                                        ui_slot_for_item(item_id, count);
+                                    hud_dirty = true;
+                                }
+                            }
                             RenderSceneUpdate::ChatLine(line) => {
                                 if let Some(r) = &mut self.renderer {
                                     let lines = &mut r.hud_mut().chat_lines;
@@ -1699,6 +2062,12 @@ impl ApplicationHandler for VoxelApp {
                                     if lines.len() > 16 {
                                         lines.remove(0);
                                     }
+                                    hud_dirty = true;
+                                }
+                            }
+                            RenderSceneUpdate::TabHint(hint) => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.hud_mut().tab_hint = hint;
                                     hud_dirty = true;
                                 }
                             }
@@ -1711,7 +2080,20 @@ impl ApplicationHandler for VoxelApp {
                     }
                 }
 
-                if !self.paused {
+                if self.swing_timer > 0.0 {
+                    self.swing_timer = (self.swing_timer - dt * 4.5).max(0.0);
+                    if let Some(r) = &mut self.renderer {
+                        r.hud_mut().hand_swing = 1.0 - self.swing_timer;
+                    }
+                    hud_dirty = true;
+                } else if let Some(r) = &mut self.renderer
+                    && r.hud_mut().hand_swing > 0.0
+                {
+                    r.hud_mut().hand_swing = 0.0;
+                    hud_dirty = true;
+                }
+
+                if !self.paused && !self.inventory_open && !self.chat_open {
                     let turn_speed = 2.0;
                     if self.pressed_keys.contains(&KeyCode::ArrowLeft) {
                         self.camera.yaw_rad -= turn_speed * dt;
@@ -1854,8 +2236,12 @@ pub fn run_voxel_window(launch: WindowLaunchConfig) -> Result<()> {
         renderer: None,
         pressed_keys: HashSet::new(),
         paused: false,
+        inventory_open: false,
+        chat_open: false,
         cursor_locked: false,
-        survival_physics: false,
+        survival_physics: true,
+        swing_timer: 0.0,
+        backpack_cycle_idx: 0,
         last_frame: Instant::now(),
         fps_timer: 0.0,
         fps_frames: 0,

@@ -1,6 +1,7 @@
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     camera_pos_fog: vec4<f32>,
+    sky_fog_sun: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -58,7 +59,8 @@ fn vs_main(
         shade = 0.70;
     }
     let ao = 0.62 + 0.1266 * ao_raw;
-    let voxel_light = clamp(max(sky_light, blk_light * 0.96), 0.14, 1.0);
+    let sun_mult = clamp(u_camera.sky_fog_sun.w, 0.18, 1.0);
+    let voxel_light = clamp(max(sky_light * sun_mult, blk_light * 0.96), 0.12, 1.0);
 
     var tile_uv = vec2<f32>(lx, lz);
     if (face == 0u || face == 1u) {
@@ -88,7 +90,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (out_alpha < 0.05) {
         discard;
     }
-    let sky_fog = vec3<f32>(0.20, 0.42, 0.95);
+    let sky_fog = u_camera.sky_fog_sun.rgb;
     let lit = texel.rgb * in.color.rgb;
     let final_rgb = mix(lit, sky_fog, in.fog_factor);
     return vec4<f32>(final_rgb, out_alpha);

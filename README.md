@@ -2,7 +2,7 @@
 
 An open-source **Minecraft: Java Edition** client written in native Rust (`wgpu` + `winit`), focused on maximum FPS, low input latency, compact memory usage, and zero garbage-collection stutters.
 
-> **Status:** Active development (Phases 0–5 complete: MC `26.3` online-mode protocol, multi-core `rayon` parallel chunk decoding + 2D greedy voxel mesher, single-VBO GPU Mega-Buffer + `multi_draw_indexed_indirect`, 8-byte vertices, local Mojang PNG / procedural `16x16` 2D texture array, smooth Sky/Block lighting + AO + horizon fog, live multiplayer entities & 2D HUD).
+> **Status:** Active development (Phases 0–7 playable survival client complete: MC `26.3` online-mode protocol, `rayon` parallel chunk decoding + 2D greedy voxel mesher, single-VBO GPU Mega-Buffer + `multi_draw_indexed_indirect`, `16x16` 2D texture array, dynamic Day/Sunset/Night sky & fog shader, 3D players/mobs/item drops, `E` Inventory & Quick-Crafting GUI, `T`/`/` live Chat & Command bar, 3D first-person hand, and WAV/OS spatial audio).
 > **Target Minecraft Version:** Java Edition **26.3** (*Wilderness Bound*, protocol **`777`**)
 > **Supported Platforms:** Windows & Linux (Vulkan / DirectX 12)
 

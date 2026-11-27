@@ -453,6 +453,43 @@ pub fn encode_chat_command(command: &str) -> Vec<u8> {
     w.into_inner()
 }
 
+/// Encodes MC `26.3` `ServerboundChatPacket` (`c2s::CHAT = 0x09`, unsigned chat message).
+pub fn encode_chat_message(message: &str) -> Vec<u8> {
+    let clipped: String = message.chars().take(256).collect();
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let mut w = PacketWriter::with_capacity(24 + clipped.len());
+    w.write_string(&clipped);
+    w.write_i64(epoch_ms);
+    w.write_i64(0); // salt
+    w.write_bool(false); // Optional<MessageSignature> = None
+    w.write_varint(0); // LastSeenMessages.Update offset
+    w.write_u8(0); // fixedBitSet(20) byte 0
+    w.write_u8(0); // fixedBitSet(20) byte 1
+    w.write_u8(0); // fixedBitSet(20) byte 2
+    w.write_u8(0); // checksum
+    w.into_inner()
+}
+
+/// Encodes `ServerboundUseItemPacket` (`c2s::USE_ITEM = 0x43`, right-click held item in air).
+pub fn encode_use_item_air(sequence: i32, yaw_deg: f32, pitch_deg: f32) -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(16);
+    w.write_varint(0); // MAIN_HAND
+    w.write_varint(sequence);
+    w.write_f32(yaw_deg);
+    w.write_f32(pitch_deg);
+    w.into_inner()
+}
+
+/// Encodes `ServerboundSwingPacket` (`c2s::PUNCH = 0x2E`, main-hand arm swing).
+pub fn encode_swing_arm() -> Vec<u8> {
+    let mut w = PacketWriter::with_capacity(2);
+    w.write_varint(0); // MAIN_HAND
+    w.into_inner()
+}
+
 /// Encodes `ServerboundAttackPacket` (`c2s::ATTACK = 0x01`, `entityId: VarInt`).
 pub fn encode_attack_entity(entity_id: i32) -> Vec<u8> {
     let mut w = PacketWriter::with_capacity(5);
@@ -509,6 +546,24 @@ pub enum PlayServerEvent {
         start: usize,
         length: usize,
         matches: Vec<String>,
+    },
+    SetTime {
+        game_time: i64,
+        day_time: i64,
+    },
+    SetPlayerInventory {
+        slot: usize,
+        item_id: u32,
+        count: u8,
+    },
+    TakeItemEntity {
+        item_entity_id: i32,
+        collector_entity_id: i32,
+        amount: u8,
+    },
+    Animate {
+        entity_id: i32,
+        action: u8,
     },
     Other(i32),
 }
@@ -639,6 +694,58 @@ pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult
                     matches,
                 });
             }
+            s2c::SET_TIME => {
+                let mut r = PacketReader::new(&payload);
+                let game_time = r.read_i64()?;
+                let map_len = r.read_usize_bounded(16)?;
+                let mut day_time = 1000i64;
+                for i in 0..map_len {
+                    let clock_id = r.read_varint()?;
+                    let total_ticks = r.read_varlong()?;
+                    let _partial = r.read_f32()?;
+                    let _rate = r.read_f32()?;
+                    if i == 0 || clock_id == 0 {
+                        day_time = total_ticks;
+                    }
+                }
+                return Ok(PlayServerEvent::SetTime {
+                    game_time,
+                    day_time,
+                });
+            }
+            s2c::SET_PLAYER_INVENTORY => {
+                let mut r = PacketReader::new(&payload);
+                let slot = r.read_varint()?.max(0) as usize;
+                let raw_cnt = r.read_varint()?;
+                let (item_id, count) = if raw_cnt <= 0 {
+                    (0, 0)
+                } else {
+                    let id = r.read_varint()?.max(0) as u32;
+                    (id, raw_cnt.min(99) as u8)
+                };
+                return Ok(PlayServerEvent::SetPlayerInventory {
+                    slot,
+                    item_id,
+                    count,
+                });
+            }
+            s2c::TAKE_ITEM_ENTITY => {
+                let mut r = PacketReader::new(&payload);
+                let item_entity_id = r.read_varint()?;
+                let collector_entity_id = r.read_varint()?;
+                let amount = r.read_varint()?.clamp(0, 99) as u8;
+                return Ok(PlayServerEvent::TakeItemEntity {
+                    item_entity_id,
+                    collector_entity_id,
+                    amount,
+                });
+            }
+            s2c::ANIMATE => {
+                let mut r = PacketReader::new(&payload);
+                let entity_id = r.read_varint()?;
+                let action = r.read_u8()?;
+                return Ok(PlayServerEvent::Animate { entity_id, action });
+            }
             other => return Ok(PlayServerEvent::Other(other)),
         }
     }
@@ -654,6 +761,8 @@ pub struct InitialPlayBootstrap {
     pub initial_players: Vec<RemotePlayerInfo>,
     pub initial_entities: Vec<RemoteEntitySpawn>,
     pub initial_health: (f32, i32),
+    pub initial_day_time: i64,
+    pub initial_inventory: [(u32, u8); 36],
 }
 
 /// Collects the initial Play state login, streamed spawn chunks, initial players/entities,
@@ -668,6 +777,8 @@ pub async fn bootstrap_play_session(
     let mut initial_players = Vec::new();
     let mut initial_entities = Vec::new();
     let mut initial_health = (20.0f32, 20i32);
+    let mut initial_day_time = 1000i64;
+    let mut initial_inventory = [(0u32, 0u8); 36];
 
     loop {
         let (pkt_id, payload) = conn.read_packet().await?;
@@ -704,6 +815,32 @@ pub async fn bootstrap_play_session(
                 let food = r.read_varint()?;
                 initial_health = (hp, food);
             }
+            s2c::SET_TIME => {
+                let mut r = PacketReader::new(&payload);
+                let _gt = r.read_i64()?;
+                let map_len = r.read_usize_bounded(16)?;
+                for i in 0..map_len {
+                    let clock_id = r.read_varint()?;
+                    let total_ticks = r.read_varlong()?;
+                    let _partial = r.read_f32()?;
+                    let _rate = r.read_f32()?;
+                    if i == 0 || clock_id == 0 {
+                        initial_day_time = total_ticks;
+                    }
+                }
+            }
+            s2c::SET_PLAYER_INVENTORY => {
+                let mut r = PacketReader::new(&payload);
+                let slot = r.read_varint()?.max(0) as usize;
+                let raw_cnt = r.read_varint()?;
+                if slot < initial_inventory.len() {
+                    initial_inventory[slot] = if raw_cnt <= 0 {
+                        (0, 0)
+                    } else {
+                        (r.read_varint()?.max(0) as u32, raw_cnt.min(99) as u8)
+                    };
+                }
+            }
             s2c::CHUNK_BATCH_FINISHED => {
                 let mut w = PacketWriter::with_capacity(4);
                 w.write_f32(25.0);
@@ -726,6 +863,8 @@ pub async fn bootstrap_play_session(
                     initial_players,
                     initial_entities,
                     initial_health,
+                    initial_day_time,
+                    initial_inventory,
                 });
             }
             _ => {}

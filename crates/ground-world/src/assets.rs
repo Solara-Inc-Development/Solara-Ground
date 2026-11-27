@@ -495,7 +495,14 @@ pub fn procedural_block_color(state_id: u32, is_top_face: bool) -> [u8; 4] {
         "minecraft:oak_leaves" => [76, 153, 56, 255],
         "minecraft:oak_planks" => [162, 130, 78, 255],
         "minecraft:glass" => [210, 235, 245, 140],
-        "minecraft:glowstone" => [248, 212, 120, 255],
+        "minecraft:glowstone" | "minecraft:torch" => [248, 212, 120, 255],
+        "minecraft:coal_ore" | "minecraft:deepslate_coal_ore" => [62, 62, 68, 255],
+        "minecraft:iron_ore" | "minecraft:deepslate_iron_ore" => [186, 148, 122, 255],
+        "minecraft:gold_ore" | "minecraft:deepslate_gold_ore" => [238, 198, 72, 255],
+        "minecraft:diamond_ore" | "minecraft:deepslate_diamond_ore" => [88, 232, 224, 255],
+        "minecraft:crafting_table" => [156, 108, 62, 255],
+        "minecraft:furnace" => [118, 118, 124, 255],
+        "minecraft:chest" => [174, 126, 56, 255],
         other => {
             let mut h = 2166136261u32;
             for &b in other.as_bytes() {

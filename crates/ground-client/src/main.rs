@@ -9,9 +9,10 @@ use ground_data::entity_hitbox;
 use ground_protocol::client::{ClientConnection, login_online, ping_server};
 use ground_protocol::config_play::{
     PlayServerEvent, bootstrap_play_session, complete_configuration, encode_attack_entity,
-    encode_chat_command, encode_move_player_pos_rot, encode_perform_respawn,
-    encode_set_carried_item, encode_start_destroy_block, encode_stop_destroy_block,
-    encode_use_item_on, read_next_play_event,
+    encode_chat_command, encode_chat_message, encode_move_player_pos_rot, encode_perform_respawn,
+    encode_request_command_suggestions, encode_set_carried_item, encode_start_destroy_block,
+    encode_stop_destroy_block, encode_swing_arm, encode_use_item_air, encode_use_item_on,
+    read_next_play_event,
 };
 use ground_protocol::generated_packets;
 use ground_render::{
@@ -180,7 +181,9 @@ fn spawn_live_network_bridge(
             let mut body = PlayerBody::new(spawn_feet);
             let mut sfx = SoundTriggerQueue::new(assets_dir);
             let mut next_seq = 1i32;
+            let mut next_tab_tx = 100i32;
             let mut net_accum = 0.0f64;
+            let mut step_accum = 0.0f64;
             let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(16));
             drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -202,6 +205,17 @@ fn spawn_live_network_bridge(
                                 }) => {
                                     let effective_eye = if survival_physics {
                                         body.step(&world_map, wish_xz, jump, dt);
+                                        if body.on_ground && (wish_xz[0].abs() > 0.1 || wish_xz[1].abs() > 0.1) {
+                                            step_accum += dt;
+                                            if step_accum >= 0.38 {
+                                                step_accum = 0.0;
+                                                sfx.trigger_spatial(
+                                                    SfxEvent::Footstep,
+                                                    [body.feet_pos[0] as f32, body.feet_pos[1] as f32, body.feet_pos[2] as f32],
+                                                    [body.feet_pos[0] as f32, body.feet_pos[1] as f32, body.feet_pos[2] as f32],
+                                                );
+                                            }
+                                        }
                                         let eye = body.eye_pos();
                                         let _ = scene_tx.send(RenderSceneUpdate::TeleportCamera {
                                             position: Vec3::new(eye[0] as f32, eye[1] as f32, eye[2] as f32),
@@ -241,6 +255,7 @@ fn spawn_live_network_bridge(
                                     ).await;
                                 }
                                 Ok(ClientWindowAction::PrimaryAttackOrBreak { eye_pos, look_dir }) => {
+                                    let _ = conn.send_packet(c2s::PUNCH, &encode_swing_arm()).await;
                                     if let Some(target_entity) = raycast_entity_target(&entities, eye_pos, look_dir, 3.8) {
                                         sfx.trigger_spatial(SfxEvent::Hurt, [eye_pos[0] as f32, eye_pos[1] as f32, eye_pos[2] as f32], [eye_pos[0] as f32, eye_pos[1] as f32, eye_pos[2] as f32]);
                                         let _ = conn.send_packet(
@@ -266,7 +281,12 @@ fn spawn_live_network_bridge(
                                         ).await;
                                     }
                                 }
-                                Ok(ClientWindowAction::PlaceLook { eye_pos, look_dir }) => {
+                                Ok(ClientWindowAction::PlaceLook {
+                                    eye_pos,
+                                    look_dir,
+                                    yaw_deg,
+                                    pitch_deg,
+                                }) => {
                                     if let Some(hit) = raycast_blocks(&world_map, eye_pos, look_dir, 6.0) {
                                         sfx.trigger_spatial(
                                             SfxEvent::BlockPlace,
@@ -279,7 +299,31 @@ fn spawn_live_network_bridge(
                                             c2s::USE_ITEM_ON,
                                             &encode_use_item_on(hit.block_pos, hit.face_direction, seq),
                                         ).await;
+                                    } else {
+                                        sfx.trigger_spatial(SfxEvent::EatFood, [0.0; 3], [0.0; 3]);
+                                        let seq = next_seq;
+                                        next_seq += 1;
+                                        let _ = conn.send_packet(
+                                            c2s::USE_ITEM,
+                                            &encode_use_item_air(seq, yaw_deg, pitch_deg),
+                                        ).await;
                                     }
+                                }
+                                Ok(ClientWindowAction::SendChatOrCommand(msg)) => {
+                                    let trimmed = msg.trim();
+                                    if let Some(cmd) = trimmed.strip_prefix('/') {
+                                        let _ = conn.send_packet(c2s::CHAT_COMMAND, &encode_chat_command(cmd)).await;
+                                    } else if !trimmed.is_empty() {
+                                        let _ = conn.send_packet(c2s::CHAT, &encode_chat_message(trimmed)).await;
+                                    }
+                                }
+                                Ok(ClientWindowAction::RequestTabComplete(input)) => {
+                                    let tx = next_tab_tx;
+                                    next_tab_tx += 1;
+                                    let _ = conn.send_packet(
+                                        c2s::COMMAND_SUGGESTION,
+                                        &encode_request_command_suggestions(tx, &input),
+                                    ).await;
                                 }
                                 Ok(ClientWindowAction::Respawn) => {
                                     let _ = conn.send_packet(c2s::CLIENT_COMMAND, &encode_perform_respawn()).await;
@@ -387,6 +431,19 @@ fn spawn_live_network_bridge(
                             }
                             PlayServerEvent::SetHealth { health, food, .. } => {
                                 let _ = scene_tx.send(RenderSceneUpdate::Vitals { health, food });
+                            }
+                            PlayServerEvent::SetTime { day_time, .. } => {
+                                let _ = scene_tx.send(RenderSceneUpdate::DayTime(day_time));
+                            }
+                            PlayServerEvent::SetPlayerInventory { slot, item_id, count } => {
+                                let _ = scene_tx.send(RenderSceneUpdate::InventorySlot { slot, item_id, count });
+                            }
+                            PlayServerEvent::TakeItemEntity { .. } => {
+                                sfx.trigger_spatial(SfxEvent::ItemPickup, [0.0; 3], [0.0; 3]);
+                            }
+                            PlayServerEvent::CommandSuggestions { matches, .. } => {
+                                let first = matches.into_iter().next().unwrap_or_default();
+                                let _ = scene_tx.send(RenderSceneUpdate::TabHint(first));
                             }
                             PlayServerEvent::SystemChat { text, .. } => {
                                 let _ = scene_tx.send(RenderSceneUpdate::ChatLine(text));
@@ -512,7 +569,7 @@ async fn run_gameplay_smoke_session(
 #[cfg(feature = "dev-offline")]
 async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
     use generated_packets::play::serverbound as c2s;
-    use ground_protocol::config_play::{ENTITY_TYPE_PLAYER, encode_request_command_suggestions};
+    use ground_protocol::config_play::ENTITY_TYPE_PLAYER;
     use ground_render::build_entities_and_outline_mesh;
     use ground_ui::{HudModel, build_full_ui_vertices};
 
@@ -661,7 +718,91 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         bail!("expected Client B respawn to restore 20.0 HP");
     }
 
-    // Exercise 3D entities + block outline + full pixel-font Survival UI
+    // Phase 7 Playable Survival Checks:
+    // 1. Lua plugin custom command (/rules)
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("rules"))
+        .await?;
+    let mut saw_lua_rules = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::SystemChat { text, .. } = read_next_play_event(&mut conn_a).await?
+            && text.contains("Solara-Sky Rules")
+        {
+            saw_lua_rules = true;
+            break;
+        }
+    }
+    if !saw_lua_rules {
+        bail!("did not receive response from auto-loaded Lua plugin /rules command");
+    }
+
+    // 2. Survival Crafting (/craft crafting_table) + live SET_PLAYER_INVENTORY sync
+    conn_a
+        .send_packet(
+            c2s::CHAT_COMMAND,
+            &encode_chat_command("craft crafting_table"),
+        )
+        .await?;
+    let mut saw_crafted_inv_slot = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::SetPlayerInventory { item_id, count, .. } =
+            read_next_play_event(&mut conn_a).await?
+            && item_id == ground_data::generated_items::id::CRAFTING_TABLE
+            && count >= 1
+        {
+            saw_crafted_inv_slot = true;
+            break;
+        }
+    }
+    if !saw_crafted_inv_slot {
+        bail!("did not receive SET_PLAYER_INVENTORY for crafted crafting_table");
+    }
+
+    // 3. Overworld Day/Night MC 26.3 WorldClock sync (/time sunset -> 12500 ticks)
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("time sunset"))
+        .await?;
+    let mut saw_sunset_clock = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::SetTime { day_time, .. } = read_next_play_event(&mut conn_a).await?
+            && (12_500..12_600).contains(&day_time)
+        {
+            saw_sunset_clock = true;
+            break;
+        }
+    }
+    if !saw_sunset_clock {
+        bail!("did not receive MC 26.3 SET_TIME WorldClock update for /time sunset");
+    }
+
+    // 4. Survival Block Break -> Floating 3D ITEM drop + Auto-Pickup (TAKE_ITEM_ENTITY)
+    conn_b
+        .send_packet(
+            c2s::PLAYER_ACTION,
+            &encode_start_destroy_block((8, -59, 7), 1, 50),
+        )
+        .await?;
+    conn_b
+        .send_packet(
+            c2s::PLAYER_ACTION,
+            &encode_stop_destroy_block((8, -59, 7), 1, 51),
+        )
+        .await?;
+    let mut saw_item_pickup = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::TakeItemEntity { amount, .. } =
+            read_next_play_event(&mut conn_b).await?
+            && amount >= 1
+        {
+            saw_item_pickup = true;
+            break;
+        }
+    }
+    if !saw_item_pickup {
+        bail!("expected Client B to auto-pickup dropped block item (TAKE_ITEM_ENTITY)");
+    }
+
+    // Exercise 3D entities + block outline + full pixel-font Survival & Inventory UI
     let (_everts, eidx) = build_entities_and_outline_mesh(
         &[RemoteEntityVisual {
             entity_id: boot_b.join_info.entity_id,
@@ -675,22 +816,23 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         width: 1280,
         height: 720,
         selected_slot: 0,
-        hotbar_top_colors: [[128, 128, 128, 255]; 9],
-        hotbar_side_colors: [[100, 100, 100, 255]; 9],
         health: 16.0,
         food: 20,
-        survival_physics: true,
-        paused: false,
+        day_time_ticks: 12_500,
+        inventory_open: true,
+        chat_open: true,
+        chat_input: "/craft wooden_sword".into(),
         fps: 300,
         frame_ms: 3.3,
         camera_pos: [8.0, -56.0, 8.0],
         chunk_count: 81,
         entity_count: starter_mobs + 1,
-        chat_lines: vec!["PvP & Mobs verified!".into()],
+        chat_lines: vec!["Playable Phase 7 verified!".into()],
+        ..Default::default()
     });
 
     println!(
-        "Phase 6 Full Survival & Multiplayer Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | StarterMobs: {} | TabComplete(/sp->spawnmob): true | PvPHealthAfterHit: 16.0 | RespawnRestoredHP: 20.0 | EntityOutlineTris: {} | PixelFontUiVerts: {}",
+        "Phase 7 Playable Survival Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | StarterMobs: {} | LuaPlugin(/rules): true | Crafting(crafting_table): true | WorldClock(sunset): true | ItemDropPickup: true | PvP+Respawn: true | EntityOutlineTris: {} | PlayableUiVerts: {}",
         boot_a.raw_chunk_packets.len(),
         initial_quads,
         (mega.vertices.len() * 8) / 1024,
@@ -899,6 +1041,9 @@ async fn main() -> Result<()> {
             sections: world_sections,
             entities: initial_entities,
             initial_health: bootstrap.initial_health,
+            initial_day_time: bootstrap.initial_day_time,
+            initial_inventory: bootstrap.initial_inventory,
+            initial_survival: bootstrap.join_info.game_mode == 0,
             initial_chunks: chunk_count,
             bridge: Some(bridge),
         });
