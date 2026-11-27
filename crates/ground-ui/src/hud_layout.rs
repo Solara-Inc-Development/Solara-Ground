@@ -538,7 +538,7 @@ pub fn build_full_ui_vertices(m: &HudModel) -> Vec<UiVertex> {
 
         // Hotbar mirror row inside Inventory (slots 0..9)
         let hy = gy + 3.0 * (cell + cgap) + 14.0;
-        for col in 0..9usize {
+        for (col, &s) in m.inventory_slots.iter().enumerate().take(9) {
             let sx = gx + (col as f32) * (cell + cgap);
             if col == sel {
                 push_rect_px(
@@ -550,7 +550,6 @@ pub fn build_full_ui_vertices(m: &HudModel) -> Vec<UiVertex> {
                 );
             }
             push_rect_px(&mut out, sw, sh, [sx, hy, cell, cell], [38, 44, 56, 240]);
-            let s = m.inventory_slots[col];
             if s.count > 0 {
                 push_rect_px(
                     &mut out,

@@ -1,9 +1,7 @@
 //! Clean-room procedural 16-bit PCM SFX synthesizer, WAV encoder, 3D spatial sound attenuation,
 //! and optional non-blocking OS audio playback worker (zero Mojang `.ogg` redistribution).
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, SyncSender};
 
 pub const SAMPLE_RATE_HZ: u32 = 22_050;
@@ -109,6 +107,9 @@ pub fn encode_wav_16bit_mono(pcm: &[i16], sample_rate: u32) -> Vec<u8> {
 fn try_play_wav_os(wav_bytes: &[u8]) {
     #[cfg(target_os = "linux")]
     {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
         for &(bin, args) in &[
             ("pw-play", &["-"][..]),
             ("paplay", &["--raw=false"][..]),
@@ -132,7 +133,6 @@ fn try_play_wav_os(wav_bytes: &[u8]) {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = wav_bytes;
-        let _ = (Command::new, Stdio::null, Write::flush);
     }
 }
 
