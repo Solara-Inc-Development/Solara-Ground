@@ -48,6 +48,7 @@ pub struct HudModel {
     pub camera_pos: [f32; 3],
     pub chunk_count: usize,
     pub entity_count: usize,
+    pub effect_badges: Vec<(String, [u8; 4])>,
     pub chat_lines: Vec<String>,
 }
 
@@ -78,6 +79,7 @@ impl Default for HudModel {
             camera_pos: [8.0, -56.0, 8.0],
             chunk_count: 0,
             entity_count: 0,
+            effect_badges: Vec::new(),
             chat_lines: Vec::new(),
         }
     }
@@ -154,6 +156,22 @@ pub fn build_full_ui_vertices(m: &HudModel) -> Vec<UiVertex> {
         "[E] INV/CRAFT  [T] CHAT  [/] CMD  [F] WALK/FLY  [SCROLL/1-9] ITEM",
         [176, 192, 218, 235],
     );
+
+    // 1b. Top-Right Active Status Potion Effect Badges
+    for (idx, (label, accent)) in m.effect_badges.iter().take(6).enumerate() {
+        let bx = (sw - 176.0).max(540.0);
+        let by = 12.0 + (idx as f32) * 26.0;
+        push_rect_px(&mut out, sw, sh, [bx, by, 164.0, 22.0], [16, 20, 28, 205]);
+        push_rect_px(&mut out, sw, sh, [bx, by, 5.0, 22.0], *accent);
+        push_text_px(
+            &mut out,
+            (sw, sh),
+            (bx + 12.0, by + 5.0),
+            1.6,
+            label,
+            [242, 246, 255, 250],
+        );
+    }
 
     // 2. Center Crosshair (when playing actively)
     let cx = (sw * 0.5).floor();

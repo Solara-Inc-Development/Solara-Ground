@@ -526,6 +526,8 @@ pub fn procedural_block_color(state_id: u32, is_top_face: bool) -> [u8; 4] {
         "minecraft:chest" => [174, 126, 56, 255],
         "minecraft:oak_door" => [166, 124, 72, 255],
         "minecraft:ladder" => [158, 126, 74, 255],
+        "minecraft:red_bed" => [208, 46, 52, 255],
+        "minecraft:white_wool" => [242, 244, 248, 255],
         other => {
             let mut h = 2166136261u32;
             for &b in other.as_bytes() {

@@ -155,6 +155,7 @@ fn spawn_live_network_bridge(
     mut world_map: ClientWorldMap,
     mut chunk_meshes: HashMap<ChunkPos, Vec<WorldSectionMesh>>,
     initial_entities: Vec<RemoteEntityVisual>,
+    local_entity_id: i32,
     spawn_feet: [f64; 3],
     assets_dir: PathBuf,
 ) -> LiveRenderBridge {
@@ -466,6 +467,24 @@ fn spawn_live_network_bridge(
                                     level,
                                     total_xp,
                                 });
+                            }
+                            PlayServerEvent::UpdateMobEffect {
+                                entity_id,
+                                effect_id,
+                                amplifier,
+                                duration_ticks,
+                            } if entity_id == local_entity_id => {
+                                let _ = scene_tx.send(RenderSceneUpdate::MobEffectUpdate {
+                                    effect_id,
+                                    amplifier,
+                                    duration_ticks,
+                                });
+                            }
+                            PlayServerEvent::RemoveMobEffect {
+                                entity_id,
+                                effect_id,
+                            } if entity_id == local_entity_id => {
+                                let _ = scene_tx.send(RenderSceneUpdate::MobEffectRemove(effect_id));
                             }
                             PlayServerEvent::CommandSuggestions { matches, .. } => {
                                 let first = matches.into_iter().next().unwrap_or_default();
@@ -955,6 +974,54 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         bail!("expected Oak Door state toggle 7254 -> 7252 on right-click");
     }
 
+    // 7. Phase 10 Status Potion Effects (/effect speed 20), Bed Night-Skip, and Dynamic Torch Lighting!
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("effect speed 20"))
+        .await?;
+    let mut saw_speed_effect = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::UpdateMobEffect {
+            effect_id,
+            duration_ticks,
+            ..
+        } = read_next_play_event(&mut conn_a).await?
+            && effect_id == ground_data::generated_effects::id::SPEED
+            && duration_ticks == 400
+        {
+            saw_speed_effect = true;
+            break;
+        }
+    }
+    if !saw_speed_effect {
+        bail!("expected UPDATE_MOB_EFFECT for /effect speed 20");
+    }
+
+    // Place Red Bed at night & right-click to sleep through night -> morning (1000 ticks)!
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("time night"))
+        .await?;
+    conn_a
+        .send_packet(
+            c2s::CHAT_COMMAND,
+            &encode_chat_command("setblock 10 -58 10 red_bed"),
+        )
+        .await?;
+    conn_a
+        .send_packet(c2s::USE_ITEM_ON, &encode_use_item_on((10, -58, 10), 1, 80))
+        .await?;
+    let mut saw_morning_bed_skip = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::SetTime { day_time, .. } = read_next_play_event(&mut conn_a).await?
+            && (1_000..1_100).contains(&day_time)
+        {
+            saw_morning_bed_skip = true;
+            break;
+        }
+    }
+    if !saw_morning_bed_skip {
+        bail!("expected Red Bed right-click at night to skip to morning (1000 ticks)");
+    }
+
     // Exercise 3D entities (including Chicken/Skeleton/Spider/Creeper/Arrow) + 3D particles/rain + F5 local player + UI
     let mut pw = ground_particles::ParticleWorld::new();
     pw.spawn_block_break([8, -59, 7], [128, 128, 132, 255]);
@@ -1026,12 +1093,16 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         camera_pos: [8.0, -56.0, 8.0],
         chunk_count: 81,
         entity_count: starter_mobs + 1,
-        chat_lines: vec!["Playable Phase 8 Biomes/Mobs/Particles verified!".into()],
+        effect_badges: vec![
+            ("SPEED 20S".into(), [92, 212, 250, 245]),
+            ("NIGHT VIS 30S".into(), [112, 242, 148, 245]),
+        ],
+        chat_lines: vec!["Playable Phase 10 Effects/Beds/TorchLight verified!".into()],
         ..Default::default()
     });
 
     println!(
-        "Phase 9 Playable Survival Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | StarterMobs: {} | Armor+XP+3DArrow+DoorToggle: true | BreakParticles+ItemPickup: true | WeatherRain: true | PvP+Respawn: true | EntityParticleTris: {} | PlayableUiVerts: {}",
+        "Phase 10 Playable Survival Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | StarterMobs: {} | Effects+BedSleep+Armor+XP+3DArrow+Door: true | BreakParticles+ItemPickup: true | WeatherRain: true | PvP+Respawn: true | EntityParticleTris: {} | PlayableUiVerts: {}",
         boot_a.raw_chunk_packets.len(),
         initial_quads,
         (mega.vertices.len() * 8) / 1024,
@@ -1226,6 +1297,7 @@ async fn main() -> Result<()> {
             world_map,
             chunk_meshes,
             initial_entities.clone(),
+            bootstrap.join_info.entity_id,
             bootstrap.spawn.position,
             cli.assets_dir.clone(),
         );

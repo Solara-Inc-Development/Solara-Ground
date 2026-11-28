@@ -2,6 +2,7 @@ use ground_audio::{
     SAMPLE_RATE_HZ, SfxEvent, SoundTriggerQueue, encode_wav_16bit_mono, synthesize_clean_room_pcm,
 };
 use ground_data::{entity_hitbox, generated_entities, generated_items};
+use ground_effects::ClientEffects;
 use ground_particles::ParticleWorld;
 use ground_progression::ProgressionState;
 use ground_ui::{HudModel, build_full_ui_vertices};
@@ -21,6 +22,10 @@ fn cross_crate_client_data_ui_audio_particles_and_greedy_mesher_integration() {
     let mut prog = ProgressionState::default();
     prog.set_armor_slot(2, generated_items::id::DIAMOND_CHESTPLATE);
     assert_eq!(prog.total_armor_points(), 8);
+
+    let mut fx = ClientEffects::new();
+    fx.apply_or_refresh(ground_data::generated_effects::id::SPEED, 0, 200);
+    assert!((fx.speed_multiplier() - 1.20).abs() < 1e-5);
 
     let mut sec = ChunkSection::new_air();
     for z in 0..16 {

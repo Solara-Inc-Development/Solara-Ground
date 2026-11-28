@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use ground_data::{generated_entities, generated_items};
+use ground_effects::ClientEffects;
 use ground_particles::{Particle, ParticleWorld};
 use ground_progression::ProgressionState;
 use ground_ui::{HudModel, QUICK_CRAFT_RECIPES, UiSlotDisplay, UiVertex, build_full_ui_vertices};
@@ -77,6 +78,12 @@ pub enum RenderSceneUpdate {
         level: i32,
         total_xp: i32,
     },
+    MobEffectUpdate {
+        effect_id: u32,
+        amplifier: u8,
+        duration_ticks: i32,
+    },
+    MobEffectRemove(u32),
 }
 
 /// Non-blocking gameplay actions pushed from the `winit` window thread to the network worker.
@@ -1049,6 +1056,7 @@ pub struct VoxelRenderer {
     local_player_model: Option<RemoteEntityVisual>,
     particle_world: ParticleWorld,
     progression: ProgressionState,
+    client_effects: ClientEffects,
     target_block: Option<[i32; 3]>,
     entity_vbo: Option<wgpu::Buffer>,
     entity_ibo: Option<wgpu::Buffer>,
@@ -1459,6 +1467,7 @@ impl VoxelRenderer {
             camera_pos: [8.0, -56.0, 8.0],
             chunk_count: initial_chunk_count,
             entity_count: initial_entities.len(),
+            effect_badges: Vec::new(),
             chat_lines: Vec::new(),
         };
 
@@ -1489,6 +1498,7 @@ impl VoxelRenderer {
             local_player_model: None,
             particle_world: ParticleWorld::new(),
             progression,
+            client_effects: ClientEffects::new(),
             target_block: None,
             entity_vbo: None,
             entity_ibo: None,
@@ -1583,6 +1593,30 @@ impl VoxelRenderer {
         self.progression.total_xp = total_xp;
         self.hud_model.xp_progress = progress;
         self.hud_model.xp_level = level;
+    }
+
+    pub fn apply_mob_effect(&mut self, effect_id: u32, amplifier: u8, duration_ticks: i32) {
+        self.client_effects
+            .apply_or_refresh(effect_id, amplifier, duration_ticks);
+        self.hud_model.effect_badges = self.client_effects.hud_badges();
+    }
+
+    pub fn remove_mob_effect(&mut self, effect_id: u32) {
+        self.client_effects.remove(effect_id);
+        self.hud_model.effect_badges = self.client_effects.hud_badges();
+    }
+
+    pub fn step_effects(&mut self, dt: f32) -> bool {
+        if self.client_effects.step(dt) {
+            self.hud_model.effect_badges = self.client_effects.hud_badges();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn speed_multiplier(&self) -> f32 {
+        self.client_effects.speed_multiplier()
     }
 
     pub fn step_particles(&mut self, dt: f32, camera_pos: Vec3) {
@@ -1712,6 +1746,14 @@ impl VoxelRenderer {
         if self.particle_world.is_raining() {
             sky_rgb = [sky_rgb[0] * 0.62, sky_rgb[1] * 0.66, sky_rgb[2] * 0.72];
             sun_mult = (sun_mult * 0.72).max(0.20);
+        }
+        if self.client_effects.has_night_vision() {
+            sky_rgb = [
+                sky_rgb[0].max(0.16),
+                sky_rgb[1].max(0.22),
+                sky_rgb[2].max(0.38),
+            ];
+            sun_mult = sun_mult.max(0.88);
         }
 
         self.queue.write_buffer(
@@ -2413,6 +2455,22 @@ impl ApplicationHandler for VoxelApp {
                                     hud_dirty = true;
                                 }
                             }
+                            RenderSceneUpdate::MobEffectUpdate {
+                                effect_id,
+                                amplifier,
+                                duration_ticks,
+                            } => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.apply_mob_effect(effect_id, amplifier, duration_ticks);
+                                    hud_dirty = true;
+                                }
+                            }
+                            RenderSceneUpdate::MobEffectRemove(effect_id) => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.remove_mob_effect(effect_id);
+                                    hud_dirty = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -2490,7 +2548,11 @@ impl ApplicationHandler for VoxelApp {
                     }
 
                     if let Some(bridge) = &self.bridge {
-                        let walk_spd = if sprint { 5.612 } else { 4.317 };
+                        let spd_mult = self
+                            .renderer
+                            .as_ref()
+                            .map_or(1.0, VoxelRenderer::speed_multiplier);
+                        let walk_spd = (if sprint { 5.612 } else { 4.317 }) * f64::from(spd_mult);
                         let fwd = self.camera.forward();
                         let _ = bridge.action_tx.send(ClientWindowAction::TickCamera {
                             eye_pos: [
@@ -2531,6 +2593,12 @@ impl ApplicationHandler for VoxelApp {
                     }
                     self.fps_frames = 0;
                     self.fps_timer = 0.0;
+                }
+
+                if let Some(r) = &mut self.renderer
+                    && r.step_effects(dt)
+                {
+                    hud_dirty = true;
                 }
 
                 if hud_dirty && let Some(r) = &mut self.renderer {

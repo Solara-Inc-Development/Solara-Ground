@@ -18,6 +18,7 @@ clap.workspace = true
 glam.workspace = true
 ground-audio.workspace = true
 ground-data.workspace = true
+ground-effects.workspace = true
 ground-particles.workspace = true
 ground-progression.workspace = true
 ground-protocol.workspace = true

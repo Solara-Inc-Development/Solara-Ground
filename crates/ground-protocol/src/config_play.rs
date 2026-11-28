@@ -576,6 +576,16 @@ pub enum PlayServerEvent {
         level: i32,
         total_xp: i32,
     },
+    UpdateMobEffect {
+        entity_id: i32,
+        effect_id: u32,
+        amplifier: u8,
+        duration_ticks: i32,
+    },
+    RemoveMobEffect {
+        entity_id: i32,
+        effect_id: u32,
+    },
     Other(i32),
 }
 
@@ -789,6 +799,29 @@ pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult
                     progress,
                     level,
                     total_xp,
+                });
+            }
+            s2c::UPDATE_MOB_EFFECT => {
+                let mut r = PacketReader::new(&payload);
+                let entity_id = r.read_varint()?;
+                let effect_id = r.read_varint()?.max(0) as u32;
+                let amplifier = r.read_varint()?.clamp(0, 255) as u8;
+                let duration_ticks = r.read_varint()?;
+                let _flags = r.read_u8()?;
+                return Ok(PlayServerEvent::UpdateMobEffect {
+                    entity_id,
+                    effect_id,
+                    amplifier,
+                    duration_ticks,
+                });
+            }
+            s2c::REMOVE_MOB_EFFECT => {
+                let mut r = PacketReader::new(&payload);
+                let entity_id = r.read_varint()?;
+                let effect_id = r.read_varint()?.max(0) as u32;
+                return Ok(PlayServerEvent::RemoveMobEffect {
+                    entity_id,
+                    effect_id,
                 });
             }
             other => return Ok(PlayServerEvent::Other(other)),
