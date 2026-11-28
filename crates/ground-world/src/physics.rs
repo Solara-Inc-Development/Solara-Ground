@@ -83,12 +83,36 @@ impl ClientWorldMap {
     #[inline]
     pub fn is_solid_block(&self, x: i32, y: i32, z: i32) -> bool {
         let st = self.get_block(x, y, z);
+        if generated_blocks::is_air_state(st) || st == generated_blocks::default_state::WATER {
+            return false;
+        }
+        // Open oak_door (states 7243..=7306 where open=true has even (st-7243)/2) is passable!
+        if (7243..=7306).contains(&st) && (((st - 7243) / 2) & 1) == 0 {
+            return false;
+        }
+        if let Some(b) = generated_blocks::block_by_state_id(st)
+            && matches!(b.name, "minecraft:ladder" | "minecraft:torch")
+        {
+            return false;
+        }
+        true
+    }
+
+    #[inline]
+    pub fn is_raycast_target(&self, x: i32, y: i32, z: i32) -> bool {
+        let st = self.get_block(x, y, z);
         !generated_blocks::is_air_state(st) && st != generated_blocks::default_state::WATER
     }
 
     #[inline]
     pub fn is_water_block(&self, x: i32, y: i32, z: i32) -> bool {
         self.get_block(x, y, z) == generated_blocks::default_state::WATER
+    }
+
+    #[inline]
+    pub fn is_ladder_block(&self, x: i32, y: i32, z: i32) -> bool {
+        generated_blocks::block_by_state_id(self.get_block(x, y, z))
+            .is_some_and(|b| b.name == "minecraft:ladder")
     }
 }
 
@@ -155,6 +179,27 @@ impl Aabb {
         }
         false
     }
+
+    fn intersects_ladder(&self, world: &ClientWorldMap) -> bool {
+        const EPS: f64 = 1e-7;
+        let x0 = (self.min_x + EPS).floor() as i32;
+        let x1 = (self.max_x - EPS).floor() as i32;
+        let y0 = (self.min_y + EPS).floor() as i32;
+        let y1 = (self.max_y - EPS).floor() as i32;
+        let z0 = (self.min_z + EPS).floor() as i32;
+        let z1 = (self.max_z - EPS).floor() as i32;
+
+        for y in y0..=y1 {
+            for z in z0..=z1 {
+                for x in x0..=x1 {
+                    if world.is_ladder_block(x, y, z) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Kinematic & collision state for the local player (`0.6 x 1.8 x 0.6` hitbox).
@@ -164,6 +209,7 @@ pub struct PlayerBody {
     pub velocity: [f64; 3],
     pub on_ground: bool,
     pub in_water: bool,
+    pub on_ladder: bool,
 }
 
 impl PlayerBody {
@@ -173,6 +219,7 @@ impl PlayerBody {
             velocity: [0.0, 0.0, 0.0],
             on_ground: false,
             in_water: false,
+            on_ladder: false,
         }
     }
 
@@ -180,10 +227,20 @@ impl PlayerBody {
         [self.feet_pos[0], self.feet_pos[1] + 1.62, self.feet_pos[2]]
     }
 
-    /// Advances gravity/buoyancy, jump/swimming, and axis-by-axis (`Y`, `X`, `Z`) voxel AABB collision.
+    /// Advances gravity/buoyancy/ladder-climb, jump/swimming, and axis-by-axis (`Y`, `X`, `Z`) voxel AABB collision.
     pub fn step(&mut self, world: &ClientWorldMap, wish_vel_xz: [f64; 2], jump: bool, dt: f64) {
-        self.in_water = Aabb::from_feet(self.feet_pos).intersects_water(world);
-        if self.in_water {
+        let cur_box = Aabb::from_feet(self.feet_pos);
+        self.in_water = cur_box.intersects_water(world);
+        self.on_ladder = cur_box.intersects_ladder(world);
+        if self.on_ladder {
+            self.velocity[0] = wish_vel_xz[0].clamp(-2.8, 2.8);
+            self.velocity[2] = wish_vel_xz[1].clamp(-2.8, 2.8);
+            if jump || wish_vel_xz[0].abs() > 0.1 || wish_vel_xz[1].abs() > 0.1 {
+                self.velocity[1] = 3.6;
+            } else {
+                self.velocity[1] = -2.0;
+            }
+        } else if self.in_water {
             self.velocity[0] = wish_vel_xz[0] * 0.72;
             self.velocity[2] = wish_vel_xz[1] * 0.72;
             if jump {
@@ -322,7 +379,7 @@ pub fn raycast_blocks(
     let mut t = 0.0;
 
     while t <= max_dist {
-        if world.is_solid_block(x, y, z) {
+        if world.is_raycast_target(x, y, z) {
             return Some(VoxelRayHit {
                 block_pos: (x, y, z),
                 adjacent_pos: prev,
@@ -418,5 +475,26 @@ mod tests {
         body.step(&world, [0.0, 0.0], true, 0.05);
         assert!(body.in_water);
         assert!(body.feet_pos[1] > -59.0);
+    }
+
+    #[test]
+    fn player_climbs_ladder_and_walks_through_open_oak_door() {
+        let mut world = flat_test_world();
+        let ladder = generated_blocks::BLOCK_RANGES
+            .iter()
+            .find(|r| r.name == "minecraft:ladder")
+            .unwrap()
+            .default_state_id;
+        world.set_block(2, -59, 2, ladder);
+        let mut body = PlayerBody::new([2.5, -59.0, 2.5]);
+        body.step(&world, [0.0, 0.0], true, 0.05);
+        assert!(body.on_ladder);
+        assert!(body.feet_pos[1] > -59.0);
+
+        // Closed oak_door (7254) is solid; open oak_door (7252) is passable
+        world.set_block(3, -59, 2, 7254);
+        assert!(world.is_solid_block(3, -59, 2));
+        world.set_block(3, -59, 2, 7252);
+        assert!(!world.is_solid_block(3, -59, 2));
     }
 }

@@ -32,6 +32,9 @@ pub struct HudModel {
     pub inventory_slots: [UiSlotDisplay; 36],
     pub health: f32,
     pub food: i32,
+    pub armor_points: u8,
+    pub xp_level: i32,
+    pub xp_progress: f32,
     pub day_time_ticks: i64,
     pub hand_swing: f32,
     pub survival_physics: bool,
@@ -59,6 +62,9 @@ impl Default for HudModel {
             inventory_slots: [UiSlotDisplay::default(); 36],
             health: 20.0,
             food: 20,
+            armor_points: 0,
+            xp_level: 0,
+            xp_progress: 0.0,
             day_time_ticks: 1000,
             hand_swing: 0.0,
             survival_physics: true,
@@ -247,7 +253,73 @@ pub fn build_full_ui_vertices(m: &HudModel) -> Vec<UiVertex> {
     let bar_y = (sh - slot_px - 22.0).max(64.0);
 
     let hp_half_units = m.health.clamp(0.0, 20.0).ceil() as i32;
-    let hearts_y = bar_y - 22.0;
+    let hearts_y = bar_y - 28.0;
+
+    // 10 Silver Armor Chestplate Icons (when wearing armor!)
+    if m.armor_points > 0 {
+        let armor_y = hearts_y - 16.0;
+        let ap = i32::from(m.armor_points.min(20));
+        for a in 0..10i32 {
+            let ax = bar_x + (a as f32) * 17.0;
+            push_rect_px(
+                &mut out,
+                sw,
+                sh,
+                [ax, armor_y, 14.0, 13.0],
+                [22, 26, 34, 220],
+            );
+            let thresh = (a + 1) * 2;
+            if ap >= thresh {
+                push_rect_px(
+                    &mut out,
+                    sw,
+                    sh,
+                    [ax + 2.0, armor_y + 2.0, 10.0, 9.0],
+                    [208, 220, 236, 255],
+                );
+            } else if ap == thresh - 1 {
+                push_rect_px(
+                    &mut out,
+                    sw,
+                    sh,
+                    [ax + 2.0, armor_y + 2.0, 5.0, 9.0],
+                    [208, 220, 236, 255],
+                );
+            }
+        }
+    }
+
+    // Green Experience Progress Bar + XP Level Counter right above Hotbar
+    let xp_bar_y = bar_y - 12.0;
+    push_rect_px(
+        &mut out,
+        sw,
+        sh,
+        [bar_x, xp_bar_y, total_w, 5.0],
+        [20, 32, 22, 215],
+    );
+    let fill_w = (total_w * m.xp_progress.clamp(0.0, 1.0)).floor();
+    if fill_w > 0.0 {
+        push_rect_px(
+            &mut out,
+            sw,
+            sh,
+            [bar_x, xp_bar_y, fill_w, 5.0],
+            [118, 246, 92, 255],
+        );
+    }
+    if m.xp_level > 0 {
+        let lvl_str = m.xp_level.to_string();
+        let lx = cx - (lvl_str.len() as f32) * 5.5;
+        push_text_px(
+            &mut out,
+            (sw, sh),
+            (lx, xp_bar_y - 11.0),
+            1.7,
+            &lvl_str,
+            [138, 255, 108, 255],
+        );
+    }
     for h in 0..10i32 {
         let hx = bar_x + (h as f32) * 17.0;
         push_rect_px(

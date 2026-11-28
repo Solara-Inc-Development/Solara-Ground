@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ground-data",
+    "crates/ground-progression",
     "crates/ground-protocol",
     "crates/ground-world",
     "crates/ground-ui",
@@ -48,6 +49,7 @@ wgpu = "24"
 winit = "0.30"
 
 ground-data = { path = "crates/ground-data" }
+ground-progression = { path = "crates/ground-progression" }
 ground-protocol = { path = "crates/ground-protocol" }
 ground-world = { path = "crates/ground-world" }
 ground-ui = { path = "crates/ground-ui" }

@@ -15,6 +15,8 @@ pub enum SfxEvent {
     UiClick,
     ItemPickup,
     EatFood,
+    BowShoot,
+    LevelUp,
 }
 
 impl SfxEvent {
@@ -28,6 +30,8 @@ impl SfxEvent {
             Self::UiClick => "minecraft/sounds/random/click.ogg",
             Self::ItemPickup => "minecraft/sounds/random/pop.ogg",
             Self::EatFood => "minecraft/sounds/random/eat1.ogg",
+            Self::BowShoot => "minecraft/sounds/random/bow.ogg",
+            Self::LevelUp => "minecraft/sounds/random/levelup.ogg",
         }
     }
 }
@@ -57,6 +61,8 @@ pub fn synthesize_clean_room_pcm(event: SfxEvent, volume: f32) -> Vec<i16> {
         SfxEvent::UiClick => (28, 680.0, 120.0, 0.12),
         SfxEvent::ItemPickup => (65, 520.0, 420.0, 0.08),
         SfxEvent::EatFood => (85, 165.0, 40.0, 0.62),
+        SfxEvent::BowShoot => (75, 380.0, -140.0, 0.28),
+        SfxEvent::LevelUp => (140, 620.0, 360.0, 0.05),
     };
 
     let sample_count = (SAMPLE_RATE_HZ as usize * duration_ms) / 1000;

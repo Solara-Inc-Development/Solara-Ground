@@ -12,6 +12,7 @@ bytemuck.workspace = true
 glam.workspace = true
 ground-data.workspace = true
 ground-particles.workspace = true
+ground-progression.workspace = true
 ground-ui.workspace = true
 ground-world.workspace = true
 pollster.workspace = true

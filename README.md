@@ -2,7 +2,7 @@
 
 An open-source **Minecraft: Java Edition** client written in native Rust (`wgpu` + `winit`), focused on maximum FPS, low input latency, compact memory usage, and zero garbage-collection stutters.
 
-> **Status:** Active development (Phases 0–8 playable survival client complete across **9 modular crates**: MC `26.3` online-mode protocol, `rayon` parallel chunk decoding + 2D greedy voxel mesher, single-VBO GPU Mega-Buffer + `multi_draw_indexed_indirect`, `16x16` 2D texture array, 5-biome block colors, water swimming, `F5` third-person camera, 8 3D Overworld mob models, 3D block-break particles & rain streaks, `E` Inventory/Crafting GUI, `T`/`/` live Chat & Command bar, and WAV/OS spatial audio).
+> **Status:** Active development (Phases 0–9 playable survival client complete across **10 modular crates**: MC `26.3` online-mode protocol, `rayon` parallel chunk decoding + 2D greedy voxel mesher, single-VBO GPU Mega-Buffer + `multi_draw_indexed_indirect`, `16x16` 2D texture array, 5-biome block colors, water swimming & ladder climbing, interactive open/closed doors, `F5` third-person camera, 8 3D Overworld mobs + 3D flying arrows, 3D block-break particles & rain streaks, Armor HUD & XP bar, `E` Inventory/Crafting GUI, `T`/`/` live Chat & Command bar, and WAV/OS spatial audio).
 > **Target Minecraft Version:** Java Edition **26.3** (*Wilderness Bound*, protocol **`777`**)
 > **Supported Platforms:** Windows & Linux (Vulkan / DirectX 12)
 
@@ -16,6 +16,7 @@ An open-source **Minecraft: Java Edition** client written in native Rust (`wgpu`
 ## Workspace Layout
 
 - `crates/ground-data` — Generated MC `26.3` (`777`) items (`1,658`), entity types (`161`) + hitboxes, sound events (`1,991`), particles (`128`), and mob effects (`40`)
+- `crates/ground-progression` — Client-side equipped Armor defense calculator and Player Experience (`SET_EXPERIENCE`) tracker
 - `crates/ground-protocol` — MC `26.3` (`777`) protocol primitives, online-mode session join & AES-128-CFB8 encryption, and Play/Survival client codecs
 - `crates/ground-world` — Bit-packed paletted chunks, `SectionLight`, `rayon` multi-core 2D greedy voxel mesher (`8`-byte vertices), AABB physics, DDA raycaster & `LocalMojangAssets`
 - `crates/ground-ui` — Clean-room `5x7` bitmap pixel font, F3-lite telemetry, 10 Survival Hearts, 10 Hunger icons, 9-slot hotbar, chat feed & `Esc` Pause/Settings menu

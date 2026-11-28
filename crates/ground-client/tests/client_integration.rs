@@ -3,6 +3,7 @@ use ground_audio::{
 };
 use ground_data::{entity_hitbox, generated_entities, generated_items};
 use ground_particles::ParticleWorld;
+use ground_progression::ProgressionState;
 use ground_ui::{HudModel, build_full_ui_vertices};
 use ground_world::ChunkSection;
 use ground_world::mesh::mesh_section;
@@ -16,6 +17,10 @@ fn cross_crate_client_data_ui_audio_particles_and_greedy_mesher_integration() {
     let mut pw = ParticleWorld::new();
     pw.spawn_block_break([0, -60, 0], [120, 120, 120, 255]);
     assert_eq!(pw.particles().len(), 18);
+
+    let mut prog = ProgressionState::default();
+    prog.set_armor_slot(2, generated_items::id::DIAMOND_CHESTPLATE);
+    assert_eq!(prog.total_armor_points(), 8);
 
     let mut sec = ChunkSection::new_air();
     for z in 0..16 {

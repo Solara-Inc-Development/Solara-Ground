@@ -182,6 +182,7 @@ fn spawn_live_network_bridge(
             let mut sfx = SoundTriggerQueue::new(assets_dir);
             let mut next_seq = 1i32;
             let mut next_tab_tx = 100i32;
+            let mut last_xp_level = 0i32;
             let mut net_accum = 0.0f64;
             let mut step_accum = 0.0f64;
             let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(16));
@@ -300,7 +301,7 @@ fn spawn_live_network_bridge(
                                             &encode_use_item_on(hit.block_pos, hit.face_direction, seq),
                                         ).await;
                                     } else {
-                                        sfx.trigger_spatial(SfxEvent::EatFood, [0.0; 3], [0.0; 3]);
+                                        sfx.trigger_spatial(SfxEvent::BowShoot, [0.0; 3], [0.0; 3]);
                                         let seq = next_seq;
                                         next_seq += 1;
                                         let _ = conn.send_packet(
@@ -454,6 +455,17 @@ fn spawn_live_network_bridge(
                             }
                             PlayServerEvent::WeatherRain(raining) => {
                                 let _ = scene_tx.send(RenderSceneUpdate::WeatherRain(raining));
+                            }
+                            PlayServerEvent::SetExperience { progress, level, total_xp } => {
+                                if level > last_xp_level {
+                                    sfx.trigger_spatial(SfxEvent::LevelUp, [0.0; 3], [0.0; 3]);
+                                }
+                                last_xp_level = level;
+                                let _ = scene_tx.send(RenderSceneUpdate::Experience {
+                                    progress,
+                                    level,
+                                    total_xp,
+                                });
                             }
                             PlayServerEvent::CommandSuggestions { matches, .. } => {
                                 let first = matches.into_iter().next().unwrap_or_default();
@@ -842,7 +854,108 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         bail!("expected GAME_EVENT WeatherRain(true) from /weather rain");
     }
 
-    // Exercise 3D entities (including Chicken/Skeleton/Spider/Creeper) + 3D particles/rain + F5 local player + UI
+    // 6. Phase 9 Experience (/xp 25 -> SetExperience), Armor Equipping, 3D Bow/Arrow & Oak Door Toggle!
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("xp 25"))
+        .await?;
+    let mut saw_xp_level = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::SetExperience {
+            level, total_xp, ..
+        } = read_next_play_event(&mut conn_a).await?
+            && level >= 2
+            && total_xp >= 25
+        {
+            saw_xp_level = true;
+            break;
+        }
+    }
+    if !saw_xp_level {
+        bail!("expected SET_EXPERIENCE update with level >= 2 for /xp 25");
+    }
+
+    // Clear hotbar & equip iron_chestplate via right-click (USE_ITEM -> slot 38)!
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("clear"))
+        .await?;
+    conn_a
+        .send_packet(c2s::SET_CARRIED_ITEM, &encode_set_carried_item(0))
+        .await?;
+    conn_a
+        .send_packet(
+            c2s::CHAT_COMMAND,
+            &encode_chat_command("give iron_chestplate 1"),
+        )
+        .await?;
+    conn_a
+        .send_packet(c2s::USE_ITEM, &encode_use_item_air(70, 0.0, 0.0))
+        .await?;
+    let mut saw_armor_slot = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::SetPlayerInventory {
+            slot: 38,
+            item_id,
+            count: 1,
+        } = read_next_play_event(&mut conn_a).await?
+            && item_id == ground_data::generated_items::id::IRON_CHESTPLATE
+        {
+            saw_armor_slot = true;
+            break;
+        }
+    }
+    if !saw_armor_slot {
+        bail!("expected SET_PLAYER_INVENTORY slot 38 for equipped iron_chestplate");
+    }
+
+    // Shoot 3D Arrow from Bow -> verify live ADD_ENTITY with ARROW (6)!
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("give bow 1"))
+        .await?;
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("give arrow 4"))
+        .await?;
+    conn_a
+        .send_packet(c2s::USE_ITEM, &encode_use_item_air(71, 0.0, 0.0))
+        .await?;
+    let mut saw_arrow_spawn = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::AddEntity(ent) = read_next_play_event(&mut conn_a).await?
+            && ent.entity_type == ground_data::generated_entities::id::ARROW as i32
+        {
+            saw_arrow_spawn = true;
+            break;
+        }
+    }
+    if !saw_arrow_spawn {
+        bail!("expected live ADD_ENTITY for shot 3D Arrow projectile");
+    }
+
+    // Place & toggle Oak Door (7254 closed -> 7252 open)!
+    conn_a
+        .send_packet(
+            c2s::CHAT_COMMAND,
+            &encode_chat_command("setblock 9 -58 9 oak_door"),
+        )
+        .await?;
+    conn_a
+        .send_packet(c2s::USE_ITEM_ON, &encode_use_item_on((9, -58, 9), 1, 72))
+        .await?;
+    let mut saw_door_open = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::BlockUpdate {
+            pos: (9, -58, 9),
+            state_id: 7252,
+        } = read_next_play_event(&mut conn_a).await?
+        {
+            saw_door_open = true;
+            break;
+        }
+    }
+    if !saw_door_open {
+        bail!("expected Oak Door state toggle 7254 -> 7252 on right-click");
+    }
+
+    // Exercise 3D entities (including Chicken/Skeleton/Spider/Creeper/Arrow) + 3D particles/rain + F5 local player + UI
     let mut pw = ground_particles::ParticleWorld::new();
     pw.spawn_block_break([8, -59, 7], [128, 128, 132, 255]);
     pw.set_raining(true);
@@ -879,6 +992,12 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
                 feet_pos: Vec3::new(6.0, -58.0, 8.0),
                 yaw_deg: 270.0,
             },
+            RemoteEntityVisual {
+                entity_id: 9005,
+                entity_type: ground_data::generated_entities::id::ARROW,
+                feet_pos: Vec3::new(8.0, -56.5, 10.0),
+                yaw_deg: 0.0,
+            },
         ],
         Some(RemoteEntityVisual {
             entity_id: -1,
@@ -895,6 +1014,9 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         selected_slot: 0,
         health: 16.0,
         food: 20,
+        armor_points: 15,
+        xp_level: 3,
+        xp_progress: 0.65,
         day_time_ticks: 12_500,
         inventory_open: true,
         chat_open: true,
@@ -909,7 +1031,7 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
     });
 
     println!(
-        "Phase 8 Playable Survival Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | StarterMobs: {} | LuaPlugin(/rules): true | Crafting(crafting_table): true | WorldClock(sunset): true | BreakParticles+ItemPickup: true | WeatherRain: true | PvP+Respawn: true | EntityParticleTris: {} | PlayableUiVerts: {}",
+        "Phase 9 Playable Survival Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | StarterMobs: {} | Armor+XP+3DArrow+DoorToggle: true | BreakParticles+ItemPickup: true | WeatherRain: true | PvP+Respawn: true | EntityParticleTris: {} | PlayableUiVerts: {}",
         boot_a.raw_chunk_packets.len(),
         initial_quads,
         (mega.vertices.len() * 8) / 1024,
@@ -1120,6 +1242,7 @@ async fn main() -> Result<()> {
             initial_health: bootstrap.initial_health,
             initial_day_time: bootstrap.initial_day_time,
             initial_inventory: bootstrap.initial_inventory,
+            initial_xp: bootstrap.initial_xp,
             initial_survival: bootstrap.join_info.game_mode == 0,
             initial_chunks: chunk_count,
             bridge: Some(bridge),

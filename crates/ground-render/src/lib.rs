@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use ground_data::{generated_entities, generated_items};
 use ground_particles::{Particle, ParticleWorld};
+use ground_progression::ProgressionState;
 use ground_ui::{HudModel, QUICK_CRAFT_RECIPES, UiSlotDisplay, UiVertex, build_full_ui_vertices};
 use ground_world::assets::{
     ATLAS_LAYER_COUNT, BlockTextureAtlas, TILE_SIZE, procedural_block_color,
@@ -71,6 +72,11 @@ pub enum RenderSceneUpdate {
         state_id: u32,
     },
     WeatherRain(bool),
+    Experience {
+        progress: f32,
+        level: i32,
+        total_xp: i32,
+    },
 }
 
 /// Non-blocking gameplay actions pushed from the `winit` window thread to the network worker.
@@ -350,6 +356,36 @@ pub fn build_scene_entities_particles_and_outline_mesh(
     for e in entities.iter().chain(local_player.as_ref()) {
         let yaw_rad = e.yaw_deg.to_radians();
         match e.entity_type {
+            generated_entities::id::ARROW => {
+                // 3D wooden shaft + steel arrowhead + white feather fletching!
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.025, -0.025, -0.34),
+                    Vec3::new(0.025, 0.025, 0.24),
+                    [168, 126, 72, 255],
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.045, -0.045, 0.24),
+                    Vec3::new(0.045, 0.045, 0.36),
+                    [210, 218, 228, 255],
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.06, -0.06, -0.40),
+                    Vec3::new(0.06, 0.06, -0.30),
+                    [246, 248, 252, 255],
+                );
+            }
             generated_entities::id::ITEM => {
                 let spin = (e.entity_id as f32) * 0.75 + e.yaw_deg.to_radians();
                 let loot_pos = e.feet_pos + Vec3::new(0.0, 0.16, 0.0);
@@ -1012,6 +1048,7 @@ pub struct VoxelRenderer {
     entities_cache: Vec<RemoteEntityVisual>,
     local_player_model: Option<RemoteEntityVisual>,
     particle_world: ParticleWorld,
+    progression: ProgressionState,
     target_block: Option<[i32; 3]>,
     entity_vbo: Option<wgpu::Buffer>,
     entity_ibo: Option<wgpu::Buffer>,
@@ -1030,7 +1067,8 @@ impl VoxelRenderer {
         initial_entities: &[RemoteEntityVisual],
         initial_health: (f32, i32),
         initial_day_time: i64,
-        initial_inventory: &[(u32, u8); 36],
+        initial_inventory: &[(u32, u8); 40],
+        initial_xp: (f32, i32, i32),
         initial_survival: bool,
         initial_chunk_count: usize,
     ) -> Result<Self> {
@@ -1382,8 +1420,19 @@ impl VoxelRenderer {
 
         let (tops, sides) = hotbar_icon_colors();
         let mut inv_slots = [UiSlotDisplay::default(); 36];
-        for (idx, &(iid, cnt)) in initial_inventory.iter().enumerate() {
+        for (idx, &(iid, cnt)) in initial_inventory.iter().take(36).enumerate() {
             inv_slots[idx] = ui_slot_for_item(iid, cnt);
+        }
+        let mut progression = ProgressionState {
+            armor_items: [0; 4],
+            xp_progress: initial_xp.0,
+            xp_level: initial_xp.1,
+            total_xp: initial_xp.2,
+        };
+        for (a_idx, &(iid, cnt)) in initial_inventory[36..40].iter().enumerate() {
+            if cnt > 0 {
+                progression.set_armor_slot(a_idx, iid);
+            }
         }
         let hud_model = HudModel {
             width: config.width,
@@ -1394,6 +1443,9 @@ impl VoxelRenderer {
             inventory_slots: inv_slots,
             health: initial_health.0,
             food: initial_health.1,
+            armor_points: progression.total_armor_points(),
+            xp_level: progression.xp_level,
+            xp_progress: progression.xp_progress,
             day_time_ticks: initial_day_time,
             hand_swing: 0.0,
             survival_physics: initial_survival,
@@ -1436,6 +1488,7 @@ impl VoxelRenderer {
             entities_cache: initial_entities.to_vec(),
             local_player_model: None,
             particle_world: ParticleWorld::new(),
+            progression,
             target_block: None,
             entity_vbo: None,
             entity_ibo: None,
@@ -1516,6 +1569,20 @@ impl VoxelRenderer {
 
     pub fn set_weather_rain(&mut self, raining: bool) {
         self.particle_world.set_raining(raining);
+    }
+
+    pub fn update_armor_slot(&mut self, armor_idx: usize, item_id: u32, count: u8) {
+        self.progression
+            .set_armor_slot(armor_idx, if count > 0 { item_id } else { 0 });
+        self.hud_model.armor_points = self.progression.total_armor_points();
+    }
+
+    pub fn update_experience(&mut self, progress: f32, level: i32, total_xp: i32) {
+        self.progression.xp_progress = progress;
+        self.progression.xp_level = level;
+        self.progression.total_xp = total_xp;
+        self.hud_model.xp_progress = progress;
+        self.hud_model.xp_level = level;
     }
 
     pub fn step_particles(&mut self, dt: f32, camera_pos: Vec3) {
@@ -1784,7 +1851,8 @@ pub struct WindowLaunchConfig {
     pub entities: Vec<RemoteEntityVisual>,
     pub initial_health: (f32, i32),
     pub initial_day_time: i64,
-    pub initial_inventory: [(u32, u8); 36],
+    pub initial_inventory: [(u32, u8); 40],
+    pub initial_xp: (f32, i32, i32),
     pub initial_survival: bool,
     pub initial_chunks: usize,
     pub bridge: Option<LiveRenderBridge>,
@@ -1858,6 +1926,7 @@ impl ApplicationHandler for VoxelApp {
                     cfg.initial_health,
                     cfg.initial_day_time,
                     &cfg.initial_inventory,
+                    cfg.initial_xp,
                     cfg.initial_survival,
                     cfg.initial_chunks,
                 )) {
@@ -2292,12 +2361,15 @@ impl ApplicationHandler for VoxelApp {
                                 item_id,
                                 count,
                             } => {
-                                if let Some(r) = &mut self.renderer
-                                    && slot < r.hud_mut().inventory_slots.len()
-                                {
-                                    r.hud_mut().inventory_slots[slot] =
-                                        ui_slot_for_item(item_id, count);
-                                    hud_dirty = true;
+                                if let Some(r) = &mut self.renderer {
+                                    if slot < r.hud_mut().inventory_slots.len() {
+                                        r.hud_mut().inventory_slots[slot] =
+                                            ui_slot_for_item(item_id, count);
+                                        hud_dirty = true;
+                                    } else if (36..40).contains(&slot) {
+                                        r.update_armor_slot(slot - 36, item_id, count);
+                                        hud_dirty = true;
+                                    }
                                 }
                             }
                             RenderSceneUpdate::ChatLine(line) => {
@@ -2329,6 +2401,16 @@ impl ApplicationHandler for VoxelApp {
                             RenderSceneUpdate::WeatherRain(raining) => {
                                 if let Some(r) = &mut self.renderer {
                                     r.set_weather_rain(raining);
+                                }
+                            }
+                            RenderSceneUpdate::Experience {
+                                progress,
+                                level,
+                                total_xp,
+                            } => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.update_experience(progress, level, total_xp);
+                                    hud_dirty = true;
                                 }
                             }
                         }

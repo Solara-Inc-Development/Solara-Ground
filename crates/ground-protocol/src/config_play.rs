@@ -571,6 +571,11 @@ pub enum PlayServerEvent {
         data: i32,
     },
     WeatherRain(bool),
+    SetExperience {
+        progress: f32,
+        level: i32,
+        total_xp: i32,
+    },
     Other(i32),
 }
 
@@ -775,6 +780,17 @@ pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult
                     _ => return Ok(PlayServerEvent::Other(pkt_id)),
                 }
             }
+            s2c::SET_EXPERIENCE => {
+                let mut r = PacketReader::new(&payload);
+                let progress = r.read_f32()?;
+                let level = r.read_varint()?;
+                let total_xp = r.read_varint()?;
+                return Ok(PlayServerEvent::SetExperience {
+                    progress,
+                    level,
+                    total_xp,
+                });
+            }
             other => return Ok(PlayServerEvent::Other(other)),
         }
     }
@@ -791,7 +807,8 @@ pub struct InitialPlayBootstrap {
     pub initial_entities: Vec<RemoteEntitySpawn>,
     pub initial_health: (f32, i32),
     pub initial_day_time: i64,
-    pub initial_inventory: [(u32, u8); 36],
+    pub initial_inventory: [(u32, u8); 40],
+    pub initial_xp: (f32, i32, i32),
 }
 
 /// Collects the initial Play state login, streamed spawn chunks, initial players/entities,
@@ -807,7 +824,8 @@ pub async fn bootstrap_play_session(
     let mut initial_entities = Vec::new();
     let mut initial_health = (20.0f32, 20i32);
     let mut initial_day_time = 1000i64;
-    let mut initial_inventory = [(0u32, 0u8); 36];
+    let mut initial_inventory = [(0u32, 0u8); 40];
+    let mut initial_xp = (0.0f32, 0i32, 0i32);
 
     loop {
         let (pkt_id, payload) = conn.read_packet().await?;
@@ -843,6 +861,13 @@ pub async fn bootstrap_play_session(
                 let hp = r.read_f32()?;
                 let food = r.read_varint()?;
                 initial_health = (hp, food);
+            }
+            s2c::SET_EXPERIENCE => {
+                let mut r = PacketReader::new(&payload);
+                let p = r.read_f32()?;
+                let lvl = r.read_varint()?;
+                let tot = r.read_varint()?;
+                initial_xp = (p, lvl, tot);
             }
             s2c::SET_TIME => {
                 let mut r = PacketReader::new(&payload);
@@ -894,6 +919,7 @@ pub async fn bootstrap_play_session(
                     initial_health,
                     initial_day_time,
                     initial_inventory,
+                    initial_xp,
                 });
             }
             _ => {}

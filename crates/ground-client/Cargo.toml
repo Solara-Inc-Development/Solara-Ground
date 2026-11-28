@@ -19,6 +19,7 @@ glam.workspace = true
 ground-audio.workspace = true
 ground-data.workspace = true
 ground-particles.workspace = true
+ground-progression.workspace = true
 ground-protocol.workspace = true
 ground-render.workspace = true
 ground-ui.workspace = true
