@@ -3,12 +3,15 @@ name = "ground-render"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 ground-data.workspace = true
+ground-particles.workspace = true
 ground-ui.workspace = true
 ground-world.workspace = true
 pollster.workspace = true

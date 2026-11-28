@@ -2,7 +2,7 @@
 
 An open-source **Minecraft: Java Edition** client written in native Rust (`wgpu` + `winit`), focused on maximum FPS, low input latency, compact memory usage, and zero garbage-collection stutters.
 
-> **Status:** Active development (Phases 0–7 playable survival client complete: MC `26.3` online-mode protocol, `rayon` parallel chunk decoding + 2D greedy voxel mesher, single-VBO GPU Mega-Buffer + `multi_draw_indexed_indirect`, `16x16` 2D texture array, dynamic Day/Sunset/Night sky & fog shader, 3D players/mobs/item drops, `E` Inventory & Quick-Crafting GUI, `T`/`/` live Chat & Command bar, 3D first-person hand, and WAV/OS spatial audio).
+> **Status:** Active development (Phases 0–8 playable survival client complete across **9 modular crates**: MC `26.3` online-mode protocol, `rayon` parallel chunk decoding + 2D greedy voxel mesher, single-VBO GPU Mega-Buffer + `multi_draw_indexed_indirect`, `16x16` 2D texture array, 5-biome block colors, water swimming, `F5` third-person camera, 8 3D Overworld mob models, 3D block-break particles & rain streaks, `E` Inventory/Crafting GUI, `T`/`/` live Chat & Command bar, and WAV/OS spatial audio).
 > **Target Minecraft Version:** Java Edition **26.3** (*Wilderness Bound*, protocol **`777`**)
 > **Supported Platforms:** Windows & Linux (Vulkan / DirectX 12)
 
@@ -20,7 +20,8 @@ An open-source **Minecraft: Java Edition** client written in native Rust (`wgpu`
 - `crates/ground-world` — Bit-packed paletted chunks, `SectionLight`, `rayon` multi-core 2D greedy voxel mesher (`8`-byte vertices), AABB physics, DDA raycaster & `LocalMojangAssets`
 - `crates/ground-ui` — Clean-room `5x7` bitmap pixel font, F3-lite telemetry, 10 Survival Hearts, 10 Hunger icons, 9-slot hotbar, chat feed & `Esc` Pause/Settings menu
 - `crates/ground-audio` — Clean-room procedural 16-bit PCM SFX synthesizer & 3D spatial sound attenuation
-- `crates/ground-render` — `wgpu` + `winit` single-VBO Mega-Buffer + `multi_draw_indexed_indirect` renderer, `16x16` 2D texture array, 3D players & mobs, block selection outline & FPS mouse-look
+- `crates/ground-particles` — Lightweight 3D voxel block-break bursts, combat hit sparks & Overworld falling rain streaks
+- `crates/ground-render` — `wgpu` + `winit` single-VBO Mega-Buffer + `multi_draw_indexed_indirect` renderer, `16x16` 2D texture array, 8 3D Overworld mobs, `F5` third-person camera, 3D particles/rain & FPS mouse-look
 - `crates/ground-client` — `solara-ground` client binary (`SessionConfig` with redacted token handling + live multiplayer bridge)
 - `docs/` & `packaging/` — Architecture, GPU pipeline, EULA compliance docs & desktop entry
 - `tools/mc-codegen` — Code generator from Mojang official `--reports` JSON

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use ground_data::{generated_entities, generated_items};
+use ground_particles::{Particle, ParticleWorld};
 use ground_ui::{HudModel, QUICK_CRAFT_RECIPES, UiSlotDisplay, UiVertex, build_full_ui_vertices};
 use ground_world::assets::{
     ATLAS_LAYER_COUNT, BlockTextureAtlas, TILE_SIZE, procedural_block_color,
@@ -65,6 +66,11 @@ pub enum RenderSceneUpdate {
     ChatLine(String),
     TabHint(String),
     TargetBlock(Option<[i32; 3]>),
+    BlockBreakParticles {
+        pos: [i32; 3],
+        state_id: u32,
+    },
+    WeatherRain(bool),
 }
 
 /// Non-blocking gameplay actions pushed from the `winit` window thread to the network worker.
@@ -330,16 +336,18 @@ fn push_oriented_box(
     }
 }
 
-/// Builds a batched 3D mesh for all visible remote players, passive animals, hostile mobs,
-/// and the optional 3D target-block black selection wireframe!
-pub fn build_entities_and_outline_mesh(
+/// Builds a batched 3D mesh for all visible remote players, optional `F5` local player,
+/// 8 Overworld mob species, 3D particles & rain streaks, and target-block selection wireframe!
+pub fn build_scene_entities_particles_and_outline_mesh(
     entities: &[RemoteEntityVisual],
+    local_player: Option<RemoteEntityVisual>,
+    particles: &[Particle],
     target_block: Option<[i32; 3]>,
 ) -> (Vec<EntityVertex>, Vec<u32>) {
-    let mut verts = Vec::with_capacity(entities.len() * 144 + 288);
-    let mut indices = Vec::with_capacity(entities.len() * 216 + 432);
+    let mut verts = Vec::with_capacity(entities.len() * 144 + particles.len() * 24 + 432);
+    let mut indices = Vec::with_capacity(entities.len() * 216 + particles.len() * 36 + 648);
 
-    for e in entities {
+    for e in entities.iter().chain(local_player.as_ref()) {
         let yaw_rad = e.yaw_deg.to_radians();
         match e.entity_type {
             generated_entities::id::ITEM => {
@@ -353,6 +361,58 @@ pub fn build_entities_and_outline_mesh(
                     Vec3::new(-0.14, 0.0, -0.14),
                     Vec3::new(0.14, 0.28, 0.14),
                     [246, 214, 92, 255],
+                );
+            }
+            generated_entities::id::CHICKEN => {
+                let feathers = [248, 248, 250, 255];
+                let beak = [232, 168, 42, 255];
+                let wattle = [214, 48, 48, 255];
+                for &lx in &[-0.09, 0.05] {
+                    push_oriented_box(
+                        &mut verts,
+                        &mut indices,
+                        e.feet_pos,
+                        yaw_rad,
+                        Vec3::new(lx, 0.0, -0.04),
+                        Vec3::new(lx + 0.04, 0.24, 0.04),
+                        beak,
+                    );
+                }
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.18, 0.24, -0.22),
+                    Vec3::new(0.18, 0.52, 0.22),
+                    feathers,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.12, 0.44, 0.14),
+                    Vec3::new(0.12, 0.70, 0.34),
+                    feathers,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.08, 0.52, 0.34),
+                    Vec3::new(0.08, 0.60, 0.44),
+                    beak,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.05, 0.44, 0.34),
+                    Vec3::new(0.05, 0.52, 0.40),
+                    wattle,
                 );
             }
             generated_entities::id::PIG
@@ -397,6 +457,125 @@ pub fn build_entities_and_outline_mesh(
                     Vec3::new(0.22, leg_h + 0.62, 0.72),
                     head_c,
                 );
+            }
+            generated_entities::id::CREEPER => {
+                let creeper_green = [74, 168, 66, 255];
+                let creeper_dark = [52, 128, 46, 255];
+                for &(lx, lz) in &[(-0.24, -0.24), (0.04, -0.24), (-0.24, 0.06), (0.04, 0.06)] {
+                    push_oriented_box(
+                        &mut verts,
+                        &mut indices,
+                        e.feet_pos,
+                        yaw_rad,
+                        Vec3::new(lx, 0.0, lz),
+                        Vec3::new(lx + 0.20, 0.38, lz + 0.18),
+                        creeper_dark,
+                    );
+                }
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.22, 0.38, -0.14),
+                    Vec3::new(0.22, 1.22, 0.14),
+                    creeper_green,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.25, 1.22, -0.25),
+                    Vec3::new(0.25, 1.72, 0.25),
+                    creeper_green,
+                );
+            }
+            generated_entities::id::SKELETON => {
+                let bone = [226, 224, 214, 255];
+                let rib = [194, 192, 182, 255];
+                for &lx in &[-0.16, 0.06] {
+                    push_oriented_box(
+                        &mut verts,
+                        &mut indices,
+                        e.feet_pos,
+                        yaw_rad,
+                        Vec3::new(lx, 0.0, -0.06),
+                        Vec3::new(lx + 0.10, 0.76, 0.06),
+                        bone,
+                    );
+                }
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.22, 0.76, -0.10),
+                    Vec3::new(0.22, 1.48, 0.10),
+                    rib,
+                );
+                for &ax in &[-0.34, 0.22] {
+                    push_oriented_box(
+                        &mut verts,
+                        &mut indices,
+                        e.feet_pos,
+                        yaw_rad,
+                        Vec3::new(ax, 1.24, 0.0),
+                        Vec3::new(ax + 0.12, 1.46, 0.62),
+                        bone,
+                    );
+                }
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.24, 1.48, -0.24),
+                    Vec3::new(0.24, 1.96, 0.24),
+                    bone,
+                );
+            }
+            generated_entities::id::SPIDER => {
+                let chitin = [48, 42, 46, 255];
+                let eyes = [224, 36, 36, 255];
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.32, 0.22, -0.52),
+                    Vec3::new(0.32, 0.66, 0.08),
+                    chitin,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.24, 0.24, 0.08),
+                    Vec3::new(0.24, 0.62, 0.48),
+                    chitin,
+                );
+                push_oriented_box(
+                    &mut verts,
+                    &mut indices,
+                    e.feet_pos,
+                    yaw_rad,
+                    Vec3::new(-0.18, 0.40, 0.48),
+                    Vec3::new(0.18, 0.52, 0.53),
+                    eyes,
+                );
+                for &lz in &[-0.36, -0.14, 0.08, 0.28] {
+                    push_oriented_box(
+                        &mut verts,
+                        &mut indices,
+                        e.feet_pos,
+                        yaw_rad,
+                        Vec3::new(-0.68, 0.04, lz),
+                        Vec3::new(0.68, 0.16, lz + 0.09),
+                        chitin,
+                    );
+                }
             }
             generated_entities::id::ZOMBIE => {
                 let green_skin = [92, 152, 82, 255];
@@ -563,7 +742,28 @@ pub fn build_entities_and_outline_mesh(
         }
     }
 
+    // 3D voxel block-break shards, melee hit sparks & falling Overworld rain streaks
+    for p in particles {
+        push_oriented_box(
+            &mut verts,
+            &mut indices,
+            p.pos,
+            0.0,
+            -p.half_extents,
+            p.half_extents,
+            p.color,
+        );
+    }
+
     (verts, indices)
+}
+
+/// Builds a batched 3D mesh for entities and optional target-block wireframe.
+pub fn build_entities_and_outline_mesh(
+    entities: &[RemoteEntityVisual],
+    target_block: Option<[i32; 3]>,
+) -> (Vec<EntityVertex>, Vec<u32>) {
+    build_scene_entities_particles_and_outline_mesh(entities, None, &[], target_block)
 }
 
 pub fn build_remote_players_mesh(players: &[RemoteEntityVisual]) -> (Vec<EntityVertex>, Vec<u32>) {
@@ -810,6 +1010,8 @@ pub struct VoxelRenderer {
     visible_cmds: Vec<DrawIndexedIndirectCmd>,
     last_visible_sections: usize,
     entities_cache: Vec<RemoteEntityVisual>,
+    local_player_model: Option<RemoteEntityVisual>,
+    particle_world: ParticleWorld,
     target_block: Option<[i32; 3]>,
     entity_vbo: Option<wgpu::Buffer>,
     entity_ibo: Option<wgpu::Buffer>,
@@ -1232,6 +1434,8 @@ impl VoxelRenderer {
             visible_cmds: Vec::with_capacity(indirect_capacity),
             last_visible_sections: 0,
             entities_cache: initial_entities.to_vec(),
+            local_player_model: None,
+            particle_world: ParticleWorld::new(),
             target_block: None,
             entity_vbo: None,
             entity_ibo: None,
@@ -1299,9 +1503,37 @@ impl VoxelRenderer {
         }
     }
 
+    pub fn set_local_player_model(&mut self, model: Option<RemoteEntityVisual>) {
+        self.local_player_model = model;
+        self.rebuild_entity_and_outline_buffers();
+    }
+
+    pub fn spawn_block_break_particles(&mut self, pos: [i32; 3], state_id: u32) {
+        let rgba = procedural_block_color(state_id, true);
+        self.particle_world.spawn_block_break(pos, rgba);
+        self.rebuild_entity_and_outline_buffers();
+    }
+
+    pub fn set_weather_rain(&mut self, raining: bool) {
+        self.particle_world.set_raining(raining);
+    }
+
+    pub fn step_particles(&mut self, dt: f32, camera_pos: Vec3) {
+        let had_active =
+            !self.particle_world.particles().is_empty() || self.particle_world.is_raining();
+        if had_active {
+            self.particle_world.step(dt, camera_pos);
+            self.rebuild_entity_and_outline_buffers();
+        }
+    }
+
     fn rebuild_entity_and_outline_buffers(&mut self) {
-        let (verts, indices) =
-            build_entities_and_outline_mesh(&self.entities_cache, self.target_block);
+        let (verts, indices) = build_scene_entities_particles_and_outline_mesh(
+            &self.entities_cache,
+            self.local_player_model,
+            self.particle_world.particles(),
+            self.target_block,
+        );
         self.entity_index_count = indices.len() as u32;
         if indices.is_empty() {
             self.entity_vbo = None;
@@ -1409,7 +1641,11 @@ impl VoxelRenderer {
     pub fn render(&mut self, camera: &VoxelCamera) -> std::result::Result<(), wgpu::SurfaceError> {
         let vp = camera.view_proj_matrix();
         let frustum = Frustum::from_view_proj(vp);
-        let (sky_rgb, sun_mult) = compute_sky_fog_and_sun(self.hud_model.day_time_ticks);
+        let (mut sky_rgb, mut sun_mult) = compute_sky_fog_and_sun(self.hud_model.day_time_ticks);
+        if self.particle_world.is_raining() {
+            sky_rgb = [sky_rgb[0] * 0.62, sky_rgb[1] * 0.66, sky_rgb[2] * 0.72];
+            sun_mult = (sun_mult * 0.72).max(0.20);
+        }
 
         self.queue.write_buffer(
             &self.camera_buf,
@@ -1567,6 +1803,7 @@ struct VoxelApp {
     chat_open: bool,
     cursor_locked: bool,
     survival_physics: bool,
+    third_person: bool,
     swing_timer: f32,
     backpack_cycle_idx: usize,
     last_frame: Instant,
@@ -1944,6 +2181,14 @@ impl ApplicationHandler for VoxelApp {
                                 r.rebuild_hud();
                             }
                         }
+                        KeyCode::F5 => {
+                            self.third_person = !self.third_person;
+                            if !self.third_person
+                                && let Some(r) = &mut self.renderer
+                            {
+                                r.set_local_player_model(None);
+                            }
+                        }
                         KeyCode::KeyR => {
                             if let Some(b) = &self.bridge {
                                 let _ = b.action_tx.send(ClientWindowAction::Respawn);
@@ -2076,6 +2321,16 @@ impl ApplicationHandler for VoxelApp {
                                     r.set_target_block(tb);
                                 }
                             }
+                            RenderSceneUpdate::BlockBreakParticles { pos, state_id } => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.spawn_block_break_particles(pos, state_id);
+                                }
+                            }
+                            RenderSceneUpdate::WeatherRain(raining) => {
+                                if let Some(r) = &mut self.renderer {
+                                    r.set_weather_rain(raining);
+                                }
+                            }
                         }
                     }
                 }
@@ -2202,7 +2457,20 @@ impl ApplicationHandler for VoxelApp {
                 }
 
                 if let Some(r) = &mut self.renderer {
-                    match r.render(&self.camera) {
+                    r.step_particles(dt, self.camera.position);
+                    let mut render_cam = self.camera.clone();
+                    if self.third_person {
+                        let feet = self.camera.position - Vec3::new(0.0, 1.62, 0.0);
+                        r.set_local_player_model(Some(RemoteEntityVisual {
+                            entity_id: -1,
+                            entity_type: generated_entities::id::PLAYER,
+                            feet_pos: feet,
+                            yaw_deg: 90.0 - self.camera.yaw_rad.to_degrees(),
+                        }));
+                        render_cam.position = self.camera.position - self.camera.forward() * 3.8
+                            + Vec3::new(0.0, 0.35, 0.0);
+                    }
+                    match r.render(&render_cam) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             if let Some(w) = &self.window {
@@ -2240,6 +2508,7 @@ pub fn run_voxel_window(launch: WindowLaunchConfig) -> Result<()> {
         chat_open: false,
         cursor_locked: false,
         survival_physics: true,
+        third_person: false,
         swing_timer: 0.0,
         backpack_cycle_idx: 0,
         last_frame: Instant::now(),
@@ -2292,6 +2561,18 @@ mod tests {
                     entity_type: generated_entities::id::ZOMBIE,
                     feet_pos: Vec3::new(2.0, 0.0, 0.0),
                     yaw_deg: 90.0,
+                },
+                RemoteEntityVisual {
+                    entity_id: 3,
+                    entity_type: generated_entities::id::CREEPER,
+                    feet_pos: Vec3::new(4.0, 0.0, 0.0),
+                    yaw_deg: 180.0,
+                },
+                RemoteEntityVisual {
+                    entity_id: 4,
+                    entity_type: generated_entities::id::SPIDER,
+                    feet_pos: Vec3::new(6.0, 0.0, 0.0),
+                    yaw_deg: 270.0,
                 },
             ],
             Some([4, -59, 4]),

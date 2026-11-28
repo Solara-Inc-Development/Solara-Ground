@@ -22,6 +22,8 @@ pub const fn entity_hitbox(entity_type: u32) -> (f32, f32) {
         generated_entities::id::COW => (0.9, 1.4),
         generated_entities::id::SHEEP => (0.9, 1.3),
         generated_entities::id::CHICKEN => (0.4, 0.7),
+        generated_entities::id::SPIDER => (1.4, 0.9),
+        generated_entities::id::ITEM => (0.25, 0.25),
         _ => (0.8, 1.5),
     }
 }

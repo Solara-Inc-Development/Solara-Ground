@@ -85,6 +85,11 @@ impl ClientWorldMap {
         let st = self.get_block(x, y, z);
         !generated_blocks::is_air_state(st) && st != generated_blocks::default_state::WATER
     }
+
+    #[inline]
+    pub fn is_water_block(&self, x: i32, y: i32, z: i32) -> bool {
+        self.get_block(x, y, z) == generated_blocks::default_state::WATER
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +134,27 @@ impl Aabb {
         }
         false
     }
+
+    fn intersects_water(&self, world: &ClientWorldMap) -> bool {
+        const EPS: f64 = 1e-7;
+        let x0 = (self.min_x + EPS).floor() as i32;
+        let x1 = (self.max_x - EPS).floor() as i32;
+        let y0 = (self.min_y + EPS).floor() as i32;
+        let y1 = (self.max_y - EPS).floor() as i32;
+        let z0 = (self.min_z + EPS).floor() as i32;
+        let z1 = (self.max_z - EPS).floor() as i32;
+
+        for y in y0..=y1 {
+            for z in z0..=z1 {
+                for x in x0..=x1 {
+                    if world.is_water_block(x, y, z) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Kinematic & collision state for the local player (`0.6 x 1.8 x 0.6` hitbox).
@@ -137,6 +163,7 @@ pub struct PlayerBody {
     pub feet_pos: [f64; 3],
     pub velocity: [f64; 3],
     pub on_ground: bool,
+    pub in_water: bool,
 }
 
 impl PlayerBody {
@@ -145,6 +172,7 @@ impl PlayerBody {
             feet_pos,
             velocity: [0.0, 0.0, 0.0],
             on_ground: false,
+            in_water: false,
         }
     }
 
@@ -152,16 +180,27 @@ impl PlayerBody {
         [self.feet_pos[0], self.feet_pos[1] + 1.62, self.feet_pos[2]]
     }
 
-    /// Advances gravity, optional jump, and axis-by-axis (`Y`, `X`, `Z`) voxel AABB collision.
+    /// Advances gravity/buoyancy, jump/swimming, and axis-by-axis (`Y`, `X`, `Z`) voxel AABB collision.
     pub fn step(&mut self, world: &ClientWorldMap, wish_vel_xz: [f64; 2], jump: bool, dt: f64) {
-        self.velocity[0] = wish_vel_xz[0];
-        self.velocity[2] = wish_vel_xz[1];
-
-        if jump && self.on_ground {
-            self.velocity[1] = JUMP_VELOCITY_MPS;
-            self.on_ground = false;
+        self.in_water = Aabb::from_feet(self.feet_pos).intersects_water(world);
+        if self.in_water {
+            self.velocity[0] = wish_vel_xz[0] * 0.72;
+            self.velocity[2] = wish_vel_xz[1] * 0.72;
+            if jump {
+                self.velocity[1] = 4.2;
+                self.on_ground = false;
+            } else {
+                self.velocity[1] = (self.velocity[1] * 0.80 - 4.5 * dt).max(-2.4);
+            }
+        } else {
+            self.velocity[0] = wish_vel_xz[0];
+            self.velocity[2] = wish_vel_xz[1];
+            if jump && self.on_ground {
+                self.velocity[1] = JUMP_VELOCITY_MPS;
+                self.on_ground = false;
+            }
+            self.velocity[1] = (self.velocity[1] + GRAVITY_MPS2 * dt).max(TERMINAL_VELOCITY_MPS);
         }
-        self.velocity[1] = (self.velocity[1] + GRAVITY_MPS2 * dt).max(TERMINAL_VELOCITY_MPS);
 
         let dy = self.velocity[1] * dt;
         let dx = self.velocity[0] * dt;
@@ -368,5 +407,16 @@ mod tests {
         assert_eq!(hit.block_pos, (2, -60, 2));
         assert_eq!(hit.adjacent_pos, (2, -59, 2));
         assert_eq!(hit.face_direction, 1); // Up (+Y)
+    }
+
+    #[test]
+    fn player_swims_upward_in_water_when_holding_jump() {
+        let mut world = flat_test_world();
+        world.set_block(2, -59, 2, generated_blocks::default_state::WATER);
+        world.set_block(2, -58, 2, generated_blocks::default_state::WATER);
+        let mut body = PlayerBody::new([2.5, -59.0, 2.5]);
+        body.step(&world, [0.0, 0.0], true, 0.05);
+        assert!(body.in_water);
+        assert!(body.feet_pos[1] > -59.0);
     }
 }

@@ -441,6 +441,20 @@ fn spawn_live_network_bridge(
                             PlayServerEvent::TakeItemEntity { .. } => {
                                 sfx.trigger_spatial(SfxEvent::ItemPickup, [0.0; 3], [0.0; 3]);
                             }
+                            PlayServerEvent::LevelEvent { event_type: 2001, pos, data } => {
+                                sfx.trigger_spatial(
+                                    SfxEvent::BlockBreak,
+                                    [body.feet_pos[0] as f32, body.feet_pos[1] as f32, body.feet_pos[2] as f32],
+                                    [pos.0 as f32, pos.1 as f32, pos.2 as f32],
+                                );
+                                let _ = scene_tx.send(RenderSceneUpdate::BlockBreakParticles {
+                                    pos: [pos.0, pos.1, pos.2],
+                                    state_id: data.max(0) as u32,
+                                });
+                            }
+                            PlayServerEvent::WeatherRain(raining) => {
+                                let _ = scene_tx.send(RenderSceneUpdate::WeatherRain(raining));
+                            }
                             PlayServerEvent::CommandSuggestions { matches, .. } => {
                                 let first = matches.into_iter().next().unwrap_or_default();
                                 let _ = scene_tx.send(RenderSceneUpdate::TabHint(first));
@@ -570,7 +584,7 @@ async fn run_gameplay_smoke_session(
 async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
     use generated_packets::play::serverbound as c2s;
     use ground_protocol::config_play::ENTITY_TYPE_PLAYER;
-    use ground_render::build_entities_and_outline_mesh;
+    use ground_render::build_scene_entities_particles_and_outline_mesh;
     use ground_ui::{HudModel, build_full_ui_vertices};
 
     let (mut conn_a, fin_a) =
@@ -578,14 +592,14 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
     complete_configuration(&mut conn_a, 4).await?;
     let boot_a = bootstrap_play_session(&mut conn_a).await?;
 
-    // Verify starter Overworld mobs (Pig, Cow, Sheep, Zombie) arrived on join!
+    // Verify all 8 starter Overworld mob species (Pig, Cow, Sheep, Chicken, Zombie, Skeleton, Spider, Creeper) arrived on join!
     let starter_mobs = boot_a
         .initial_entities
         .iter()
         .filter(|e| e.entity_type != ENTITY_TYPE_PLAYER)
         .count();
-    if starter_mobs < 4 {
-        bail!("expected >= 4 starter Overworld mobs on join, got {starter_mobs}");
+    if starter_mobs < 8 {
+        bail!("expected >= 8 starter Overworld mobs on join, got {starter_mobs}");
     }
 
     let initial_raw = boot_a.raw_chunk_packets.clone();
@@ -775,7 +789,7 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         bail!("did not receive MC 26.3 SET_TIME WorldClock update for /time sunset");
     }
 
-    // 4. Survival Block Break -> Floating 3D ITEM drop + Auto-Pickup (TAKE_ITEM_ENTITY)
+    // 4. Survival Block Break -> LEVEL_EVENT(2001) block-break particles + Floating 3D ITEM drop + Auto-Pickup (TAKE_ITEM_ENTITY)
     conn_b
         .send_packet(
             c2s::PLAYER_ACTION,
@@ -788,28 +802,91 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
             &encode_stop_destroy_block((8, -59, 7), 1, 51),
         )
         .await?;
+    let mut saw_break_particles = false;
     let mut saw_item_pickup = false;
     for _ in 0..1024 {
-        if let PlayServerEvent::TakeItemEntity { amount, .. } =
-            read_next_play_event(&mut conn_b).await?
-            && amount >= 1
-        {
-            saw_item_pickup = true;
+        match read_next_play_event(&mut conn_b).await? {
+            PlayServerEvent::LevelEvent {
+                event_type: 2001, ..
+            } => {
+                saw_break_particles = true;
+            }
+            PlayServerEvent::TakeItemEntity { amount, .. } if amount >= 1 => {
+                saw_item_pickup = true;
+            }
+            _ => {}
+        }
+        if saw_break_particles && saw_item_pickup {
             break;
         }
+    }
+    if !saw_break_particles {
+        bail!("expected LEVEL_EVENT(2001) block-break particle broadcast");
     }
     if !saw_item_pickup {
         bail!("expected Client B to auto-pickup dropped block item (TAKE_ITEM_ENTITY)");
     }
 
-    // Exercise 3D entities + block outline + full pixel-font Survival & Inventory UI
-    let (_everts, eidx) = build_entities_and_outline_mesh(
-        &[RemoteEntityVisual {
-            entity_id: boot_b.join_info.entity_id,
+    // 5. Phase 8 Weather Rain broadcast (/weather rain -> GAME_EVENT WeatherRain(true))
+    conn_a
+        .send_packet(c2s::CHAT_COMMAND, &encode_chat_command("weather rain"))
+        .await?;
+    let mut saw_weather_rain = false;
+    for _ in 0..1024 {
+        if let PlayServerEvent::WeatherRain(true) = read_next_play_event(&mut conn_a).await? {
+            saw_weather_rain = true;
+            break;
+        }
+    }
+    if !saw_weather_rain {
+        bail!("expected GAME_EVENT WeatherRain(true) from /weather rain");
+    }
+
+    // Exercise 3D entities (including Chicken/Skeleton/Spider/Creeper) + 3D particles/rain + F5 local player + UI
+    let mut pw = ground_particles::ParticleWorld::new();
+    pw.spawn_block_break([8, -59, 7], [128, 128, 132, 255]);
+    pw.set_raining(true);
+    pw.step(0.05, Vec3::new(8.0, -56.0, 8.0));
+    let (_everts, eidx) = build_scene_entities_particles_and_outline_mesh(
+        &[
+            RemoteEntityVisual {
+                entity_id: boot_b.join_info.entity_id,
+                entity_type: ENTITY_TYPE_PLAYER as u32,
+                feet_pos: Vec3::new(8.0, -58.0, 8.0),
+                yaw_deg: 90.0,
+            },
+            RemoteEntityVisual {
+                entity_id: 9001,
+                entity_type: ground_data::generated_entities::id::CREEPER,
+                feet_pos: Vec3::new(10.0, -58.0, 8.0),
+                yaw_deg: 0.0,
+            },
+            RemoteEntityVisual {
+                entity_id: 9002,
+                entity_type: ground_data::generated_entities::id::SKELETON,
+                feet_pos: Vec3::new(12.0, -58.0, 8.0),
+                yaw_deg: 45.0,
+            },
+            RemoteEntityVisual {
+                entity_id: 9003,
+                entity_type: ground_data::generated_entities::id::SPIDER,
+                feet_pos: Vec3::new(14.0, -58.0, 8.0),
+                yaw_deg: 180.0,
+            },
+            RemoteEntityVisual {
+                entity_id: 9004,
+                entity_type: ground_data::generated_entities::id::CHICKEN,
+                feet_pos: Vec3::new(6.0, -58.0, 8.0),
+                yaw_deg: 270.0,
+            },
+        ],
+        Some(RemoteEntityVisual {
+            entity_id: -1,
             entity_type: ENTITY_TYPE_PLAYER as u32,
-            feet_pos: Vec3::new(8.0, -58.0, 8.0),
-            yaw_deg: 90.0,
-        }],
+            feet_pos: Vec3::new(8.0, -58.0, 6.0),
+            yaw_deg: 0.0,
+        }),
+        pw.particles(),
         Some([8, -59, 8]),
     );
     let ui_verts = build_full_ui_vertices(&HudModel {
@@ -821,18 +898,18 @@ async fn run_multiplayer_smoke(host: &str, port: u16) -> Result<()> {
         day_time_ticks: 12_500,
         inventory_open: true,
         chat_open: true,
-        chat_input: "/craft wooden_sword".into(),
+        chat_input: "/weather rain".into(),
         fps: 300,
         frame_ms: 3.3,
         camera_pos: [8.0, -56.0, 8.0],
         chunk_count: 81,
         entity_count: starter_mobs + 1,
-        chat_lines: vec!["Playable Phase 7 verified!".into()],
+        chat_lines: vec!["Playable Phase 8 Biomes/Mobs/Particles verified!".into()],
         ..Default::default()
     });
 
     println!(
-        "Phase 7 Playable Survival Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | StarterMobs: {} | LuaPlugin(/rules): true | Crafting(crafting_table): true | WorldClock(sunset): true | ItemDropPickup: true | PvP+Respawn: true | EntityOutlineTris: {} | PlayableUiVerts: {}",
+        "Phase 8 Playable Survival Smoke OK | Chunks: {} (GreedyQuads: {}, MegaVboKB: {}) | StarterMobs: {} | LuaPlugin(/rules): true | Crafting(crafting_table): true | WorldClock(sunset): true | BreakParticles+ItemPickup: true | WeatherRain: true | PvP+Respawn: true | EntityParticleTris: {} | PlayableUiVerts: {}",
         boot_a.raw_chunk_packets.len(),
         initial_quads,
         (mega.vertices.len() * 8) / 1024,

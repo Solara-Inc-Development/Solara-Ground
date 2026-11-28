@@ -490,10 +490,31 @@ pub fn procedural_block_color(state_id: u32, is_top_face: bool) -> [u8; 4] {
         "minecraft:deepslate" => [72, 72, 78, 255],
         "minecraft:bedrock" => [52, 52, 56, 255],
         "minecraft:sand" => [219, 207, 163, 255],
+        "minecraft:sandstone" => {
+            if is_top_face {
+                [228, 216, 170, 255]
+            } else {
+                [216, 202, 154, 255]
+            }
+        }
+        "minecraft:cactus" => [64, 146, 48, 255],
+        "minecraft:snow_block" => [244, 248, 252, 255],
+        "minecraft:ice" => [148, 196, 250, 210],
         "minecraft:water" => [52, 116, 212, 200],
         "minecraft:oak_log" => [109, 85, 50, 255],
         "minecraft:oak_leaves" => [76, 153, 56, 255],
+        "minecraft:birch_log" => {
+            if is_top_face {
+                [208, 196, 158, 255]
+            } else {
+                [234, 232, 226, 255]
+            }
+        }
+        "minecraft:birch_leaves" => [112, 168, 78, 255],
+        "minecraft:spruce_log" => [68, 48, 28, 255],
+        "minecraft:spruce_leaves" => [52, 98, 62, 255],
         "minecraft:oak_planks" => [162, 130, 78, 255],
+        "minecraft:cobblestone_wall" | "minecraft:mossy_cobblestone" => [96, 118, 92, 255],
         "minecraft:glass" => [210, 235, 245, 140],
         "minecraft:glowstone" | "minecraft:torch" => [248, 212, 120, 255],
         "minecraft:coal_ore" | "minecraft:deepslate_coal_ore" => [62, 62, 68, 255],

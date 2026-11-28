@@ -2,14 +2,20 @@ use ground_audio::{
     SAMPLE_RATE_HZ, SfxEvent, SoundTriggerQueue, encode_wav_16bit_mono, synthesize_clean_room_pcm,
 };
 use ground_data::{entity_hitbox, generated_entities, generated_items};
+use ground_particles::ParticleWorld;
 use ground_ui::{HudModel, build_full_ui_vertices};
 use ground_world::ChunkSection;
 use ground_world::mesh::mesh_section;
 
 #[test]
-fn cross_crate_client_data_ui_audio_and_greedy_mesher_integration() {
+fn cross_crate_client_data_ui_audio_particles_and_greedy_mesher_integration() {
     assert!(generated_items::by_key("netherite_pickaxe").is_some());
     assert_eq!(entity_hitbox(generated_entities::id::ZOMBIE), (0.6, 1.95));
+    assert_eq!(entity_hitbox(generated_entities::id::SPIDER), (1.4, 0.9));
+
+    let mut pw = ParticleWorld::new();
+    pw.spawn_block_break([0, -60, 0], [120, 120, 120, 255]);
+    assert_eq!(pw.particles().len(), 18);
 
     let mut sec = ChunkSection::new_air();
     for z in 0..16 {

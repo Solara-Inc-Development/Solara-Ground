@@ -6,6 +6,7 @@ members = [
     "crates/ground-world",
     "crates/ground-ui",
     "crates/ground-audio",
+    "crates/ground-particles",
     "crates/ground-render",
     "crates/ground-client",
     "tools/mc-codegen",
@@ -51,6 +52,7 @@ ground-protocol = { path = "crates/ground-protocol" }
 ground-world = { path = "crates/ground-world" }
 ground-ui = { path = "crates/ground-ui" }
 ground-audio = { path = "crates/ground-audio" }
+ground-particles = { path = "crates/ground-particles" }
 ground-render = { path = "crates/ground-render" }
 
 [profile.release]

@@ -565,6 +565,12 @@ pub enum PlayServerEvent {
         entity_id: i32,
         action: u8,
     },
+    LevelEvent {
+        event_type: i32,
+        pos: (i32, i32, i32),
+        data: i32,
+    },
+    WeatherRain(bool),
     Other(i32),
 }
 
@@ -745,6 +751,29 @@ pub async fn read_next_play_event(conn: &mut ClientConnection) -> ProtocolResult
                 let entity_id = r.read_varint()?;
                 let action = r.read_u8()?;
                 return Ok(PlayServerEvent::Animate { entity_id, action });
+            }
+            s2c::LEVEL_EVENT => {
+                let mut r = PacketReader::new(&payload);
+                let event_type = r.read_i32()?;
+                let pos = r.read_block_pos()?;
+                let data = r.read_i32()?;
+                let _global = r.read_bool()?;
+                return Ok(PlayServerEvent::LevelEvent {
+                    event_type,
+                    pos,
+                    data,
+                });
+            }
+            s2c::GAME_EVENT => {
+                let mut r = PacketReader::new(&payload);
+                let event_id = r.read_u8()?;
+                let param = r.read_f32()?;
+                match event_id {
+                    1 => return Ok(PlayServerEvent::WeatherRain(false)),
+                    2 => return Ok(PlayServerEvent::WeatherRain(true)),
+                    7 => return Ok(PlayServerEvent::WeatherRain(param > 0.05)),
+                    _ => return Ok(PlayServerEvent::Other(pkt_id)),
+                }
             }
             other => return Ok(PlayServerEvent::Other(other)),
         }

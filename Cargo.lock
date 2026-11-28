@@ -901,6 +901,7 @@ dependencies = [
  "glam",
  "ground-audio",
  "ground-data",
+ "ground-particles",
  "ground-protocol",
  "ground-render",
  "ground-ui",
@@ -914,6 +915,13 @@ dependencies = [
 [[package]]
 name = "ground-data"
 version = "0.1.0-alpha.1"
+
+[[package]]
+name = "ground-particles"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "glam",
+]
 
 [[package]]
 name = "ground-protocol"
@@ -944,6 +952,7 @@ dependencies = [
  "bytemuck",
  "glam",
  "ground-data",
+ "ground-particles",
  "ground-ui",
  "ground-world",
  "pollster",
